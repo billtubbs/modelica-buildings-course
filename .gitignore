@@ -1,0 +1,3 @@
+*.egg-info
+
+tutorials/district_heating_supply/plots
