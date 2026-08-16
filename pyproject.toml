@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "modelica-buildings-course"
+version = "0.1.0"
+description = "Code and materials for the Modelica-based simulation of building and district energy systems course, Aalborg University, 26-28 August 2026."
+requires-python = ">=3.11"
+authors = [
+    { name = "Bill Tubbs", email = "bill.tubbs@me.com" }
+]
+dependencies = [
+    "ipython",
+    "jupyter",
+    "numpy",
+    "matplotlib",
+    "pandas",
+    "scipy",
+    "casadi",
+    "pyyaml",
+    "modelon-impact-client",
+    "oemof.solph",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.urls]
+Course = "https://phd.moodle.aau.dk/blocks/vitrina/detail.php?id=2974"
