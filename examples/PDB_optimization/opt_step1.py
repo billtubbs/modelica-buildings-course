@@ -1,9 +1,65 @@
-# Gas boiler + heat pump + heat storage / pareto front
+"""Gas boiler + heat pump + heat storage: cost/CO2 Pareto front via MILP.
+
+This script builds and solves a family of mixed-integer linear programming
+(MILP) capacity-investment + dispatch models of a district-heat supply
+system using ``oemof.solph``, with the CBC solver as backend. The system can
+combine three heat sources feeding a common heat network:
+
+    * a gas boiler (gas -> heat),
+    * a heat pump (electricity + waste heat -> heat, fixed COP), and
+    * a thermal storage tank.
+
+Each unit's installed capacity is either optimised as an investment
+variable or pinned to a fixed value, and the fuel/electricity cost together
+with a CO2 price ("lambda", in EUR/tCO2) determine dispatch. Solving the
+model repeatedly over a sweep of CO2 prices traces out a cost (LCOH) vs.
+emissions (CO2) Pareto front for the supply system.
+
+Cases solved:
+    1. Gas boiler only (reference anchor).
+    2. Heat pump only (reference anchor).
+    3. Heat pump + storage, cost-optimal design (no gas boiler).
+    4. Gas boiler + heat pump + storage, swept over 6 CO2 prices
+       (lambda = 0, 20, 50, 100, 200, 400 EUR/tCO2).
+
+Input:
+    ``<DATA_DIR>/input_data.csv`` -- semicolon-separated hourly time series
+    with a parseable datetime index and columns:
+        * "heat demand"   heat load of the network [MW]
+        * "gas price"     gas commodity price [EUR/MWh]
+        * "el_spot_price" electricity spot price [EUR/MWh]
+
+Outputs (directories are created automatically if they do not exist):
+    ``<PLOT_DIR>/pareto_1_anchors.png``
+    ``<PLOT_DIR>/pareto_2_hp_storage.png``
+    ``<PLOT_DIR>/pareto_3_full.png``
+        Cost vs. CO2 Pareto-front scatter plots, each building on the last.
+    ``<PLOT_DIR>/dispatch_<case>.png``, ``<PLOT_DIR>/storage_content_<case>.png``
+        Hourly dispatch stack and storage state-of-charge plots, generated
+        for the cheapest full-system design and for the lambda = 20 design.
+    ``<RESULTS_DIR>/dispatch_<case>.csv``
+        Hourly dispatch time series (per technology, plus gas price and
+        energy balance check) for the same two cases.
+    ``<RESULTS_DIR>/dispatch_combitimetable_<case>.txt``
+        Modelica ``CombiTimeTable`` export of the lambda = 20 dispatch, in
+        watts, for use as a boundary condition in a downstream Modelica model.
+
+    A summary table of all solved cases is also printed to the console.
+"""
+
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import oemof.solph as solph
 import pandas as pd
 import pyomo.environ as po
+
+DATA_DIR = Path("data")
+PLOT_DIR = Path("plots")
+RESULTS_DIR = Path("results")
+
+for directory in (DATA_DIR, PLOT_DIR, RESULTS_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
 
 
 def epc(invest_cost, i=0.05, n=20):
@@ -25,26 +81,27 @@ def print_sizing_bar(res):
         return "█" * int(value * scale)
 
     print(f"\nCase = {res['case_label']}")
-    print(
-        f"Gas boiler  ({res['cap_gas_boiler_mw']:.1f} MW): {bar(res['cap_gas_boiler_mw'])}"
-    )
-    print(
-        f"Heat pump   ({res['cap_heat_pump_mw']:.1f} MW): {bar(res['cap_heat_pump_mw'])}"
-    )
-    print(
-        f"Storage (E) ({res['cap_storage_mwh']:.1f} MWh): {bar(res['cap_storage_mwh'] / 10)}"
-    )
-    print(
-        f"Storage (P) ({res['cap_storage_out_mw']:.1f} MW): {bar(res['cap_storage_out_mw'])}"
-    )
+    sizing_rows = [
+        ("Gas boiler ", res["cap_gas_boiler_mw"], "MW", res["cap_gas_boiler_mw"]),
+        ("Heat pump  ", res["cap_heat_pump_mw"], "MW", res["cap_heat_pump_mw"]),
+        ("Storage (E)", res["cap_storage_mwh"], "MWh", res["cap_storage_mwh"] / 10),
+        ("Storage (P)", res["cap_storage_out_mw"], "MW", res["cap_storage_out_mw"]),
+    ]
+    for label, value, unit, bar_value in sizing_rows:
+        print(f"{label} ({value:.1f} {unit}): {bar(bar_value)}")
+
     print(f"LCOH: {res['lcoh']:.2f} €/MWh")
     print(f"Total CO2: {res['co2']:.1f} tCO2")
-    print(f"  Dispatch [MWh/yr]:")
-    print(f"    Gas boiler:       {res['e_gas_boiler_mwh']:.1f}")
-    print(f"    Heat pump:        {res['e_heat_pump_mwh']:.1f}")
-    print(f"    Storage charge:   {res['e_storage_in_mwh']:.1f}")
-    print(f"    Storage discharge:{res['e_storage_out_mwh']:.1f}")
-    print(f"    Total heat:       {res['e_heat_demand_mwh']:.1f}")
+    print("  Dispatch [MWh/yr]:")
+    dispatch_rows = [
+        ("Gas boiler", res["e_gas_boiler_mwh"]),
+        ("Heat pump", res["e_heat_pump_mwh"]),
+        ("Storage charge", res["e_storage_in_mwh"]),
+        ("Storage discharge", res["e_storage_out_mwh"]),
+        ("Total heat", res["e_heat_demand_mwh"]),
+    ]
+    for label, value in dispatch_rows:
+        print(f"    {label + ':':<19}{value:.1f}")
 
 
 def solve_case(
@@ -120,7 +177,7 @@ def solve_case(
         inputs={
             heat_bus: solph.flows.Flow(
                 nominal_capacity=data["heat demand"].max(),
-                fix=data["heat demand"] / data["heat demand"].max(),
+                fix=(data["heat demand"] / data["heat demand"].max()),
             )
         },
     )
@@ -404,8 +461,8 @@ def plot_dispatch(res):
     slug = slugify(res["case_label"])
     fig_dispatch.tight_layout()
     fig_storage.tight_layout()
-    fig_dispatch.savefig(f"dispatch_{slug}.png", dpi=150)
-    fig_storage.savefig(f"storage_content_{slug}.png", dpi=150)
+    fig_dispatch.savefig(PLOT_DIR / f"dispatch_{slug}.png", dpi=150)
+    fig_storage.savefig(PLOT_DIR / f"storage_content_{slug}.png", dpi=150)
 
     dispatch_df = pd.DataFrame(
         {
@@ -434,7 +491,7 @@ def plot_dispatch(res):
         - dispatch_df["storage_charge"]
         - dispatch_df["heat_demand"]
     )
-    dispatch_df.to_csv(f"dispatch_{slug}.csv")
+    dispatch_df.to_csv(RESULTS_DIR / f"dispatch_{slug}.csv")
 
 
 def write_combitimetable(res, filename=None):
@@ -471,7 +528,10 @@ def write_combitimetable(res, filename=None):
     seconds = (df.index - df.index[0]).total_seconds().astype("int64")
 
     if filename is None:
-        filename = f"dispatch_combitimetable_{slugify(res['case_label'])}.txt"
+        filename = (
+            RESULTS_DIR
+            / f"dispatch_combitimetable_{slugify(res['case_label'])}.txt"
+        )
 
     with open(filename, "w") as f:
         f.write("#1\n")
@@ -500,7 +560,9 @@ def write_combitimetable(res, filename=None):
     print(f"Wrote {filename} ({len(watts)} rows)")
 
 
-data = pd.read_csv("input_data.csv", sep=";", index_col=0, parse_dates=True)
+data = pd.read_csv(
+    DATA_DIR / "input_data.csv", sep=";", index_col=0, parse_dates=True
+)
 
 # 6 CO2 prices (lambda values) used for every optimization search.
 co2_prices = [0, 20, 50, 100, 200, 400]
@@ -571,8 +633,8 @@ for cp in co2_prices:
 # on the cheap gas boiler, which is exactly what makes it the low-cost design.
 best_full = min(full_sweep, key=lambda c: c["lcoh"])
 print(
-    f"\nPlotting dispatch for the most economic full-system case:"
-    f" {best_full['case_label']} (LCOH {best_full['lcoh']:.2f} €/MWh)"
+    f"\nPlotting dispatch for the most economic full-system case: "
+    f"{best_full['case_label']} (LCOH {best_full['lcoh']:.2f} €/MWh)"
 )
 plot_dispatch(best_full)
 
@@ -581,8 +643,8 @@ plot_dispatch(best_full)
 # dispatch figures plus a CombiTimeTable file.
 case_l20 = next(c for c in full_sweep if c["co2_price"] == 20)
 print(
-    f"\nPlotting dispatch and writing Modelica table for:"
-    f" {case_l20['case_label']} (LCOH {case_l20['lcoh']:.2f} €/MWh)"
+    f"\nPlotting dispatch and writing Modelica table for: "
+    f"{case_l20['case_label']} (LCOH {case_l20['lcoh']:.2f} €/MWh)"
 )
 plot_dispatch(case_l20)
 write_combitimetable(case_l20)
@@ -861,24 +923,19 @@ for fig, name in (
     (fig2, "pareto_2_hp_storage"),
     (fig3, "pareto_3_full"),
 ):
-    fig.savefig(f"{name}.png", dpi=150)
+    fig.savefig(PLOT_DIR / f"{name}.png", dpi=150)
 
 df = pd.DataFrame([boiler_only, hp_only, hp_storage_opt] + full_sweep)
+summary_cols = [
+    "case_label",
+    "co2_price",
+    "cap_gas_boiler_mw",
+    "cap_heat_pump_mw",
+    "cap_storage_mwh",
+    "lcoh",
+    "co2",
+]
 print("\nSummary:")
-print(
-    df[
-        [
-            "case_label",
-            "co2_price",
-            "cap_gas_boiler_mw",
-            "cap_heat_pump_mw",
-            "cap_storage_mwh",
-            "lcoh",
-            "co2",
-        ]
-    ]
-    .round(3)
-    .to_string(index=False)
-)
+print(df[summary_cols].round(3).to_string(index=False))
 
 plt.show()
