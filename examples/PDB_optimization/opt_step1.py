@@ -1,9 +1,9 @@
 # Gas boiler + heat pump + heat storage / pareto front
 
-import pandas as pd
 import matplotlib.pyplot as plt
-import pyomo.environ as po
 import oemof.solph as solph
+import pandas as pd
+import pyomo.environ as po
 
 
 def epc(invest_cost, i=0.05, n=20):
@@ -13,7 +13,9 @@ def epc(invest_cost, i=0.05, n=20):
 
 def LCOH(invest_cost, operation_cost, heat_produced, revenue=0, i=0.05, n=20):
     pvf = ((1 + i) ** n - 1) / (((1 + i) ** n) * i)
-    return (invest_cost + pvf * (operation_cost - revenue)) / (pvf * heat_produced)
+    return (invest_cost + pvf * (operation_cost - revenue)) / (
+        pvf * heat_produced
+    )
 
 
 def print_sizing_bar(res):
@@ -23,10 +25,18 @@ def print_sizing_bar(res):
         return "█" * int(value * scale)
 
     print(f"\nCase = {res['case_label']}")
-    print(f"Gas boiler  ({res['cap_gas_boiler_mw']:.1f} MW): {bar(res['cap_gas_boiler_mw'])}")
-    print(f"Heat pump   ({res['cap_heat_pump_mw']:.1f} MW): {bar(res['cap_heat_pump_mw'])}")
-    print(f"Storage (E) ({res['cap_storage_mwh']:.1f} MWh): {bar(res['cap_storage_mwh'] / 10)}")
-    print(f"Storage (P) ({res['cap_storage_out_mw']:.1f} MW): {bar(res['cap_storage_out_mw'])}")
+    print(
+        f"Gas boiler  ({res['cap_gas_boiler_mw']:.1f} MW): {bar(res['cap_gas_boiler_mw'])}"
+    )
+    print(
+        f"Heat pump   ({res['cap_heat_pump_mw']:.1f} MW): {bar(res['cap_heat_pump_mw'])}"
+    )
+    print(
+        f"Storage (E) ({res['cap_storage_mwh']:.1f} MWh): {bar(res['cap_storage_mwh'] / 10)}"
+    )
+    print(
+        f"Storage (P) ({res['cap_storage_out_mw']:.1f} MW): {bar(res['cap_storage_out_mw'])}"
+    )
     print(f"LCOH: {res['lcoh']:.2f} €/MWh")
     print(f"Total CO2: {res['co2']:.1f} tCO2")
     print(f"  Dispatch [MWh/yr]:")
@@ -93,7 +103,11 @@ def solve_case(
 
     electricity_source = solph.components.Source(
         label="electricity source",
-        outputs={electricity_bus: solph.flows.Flow(variable_costs=electricity_source_cost)},
+        outputs={
+            electricity_bus: solph.flows.Flow(
+                variable_costs=electricity_source_cost
+            )
+        },
     )
 
     waste_heat_source = solph.components.Source(
@@ -231,7 +245,9 @@ def solve_case(
         return (price * df[key]).sum() if key in df.columns else 0.0
 
     cap_gas_boiler = (
-        data_caps[(("gas boiler", "heat network"), "invest")] if use_gas_boiler else 0.0
+        data_caps[(("gas boiler", "heat network"), "invest")]
+        if use_gas_boiler
+        else 0.0
     )
     if not use_heat_pump:
         cap_heat_pump = 0.0
@@ -250,7 +266,9 @@ def solve_case(
         cap_storage = solph.views.node(results, "heat storage")["scalars"][
             (("heat storage", "None"), "invest")
         ]
-        cap_storage_out = data_caps[(("heat storage", "heat network"), "invest")]
+        cap_storage_out = data_caps[
+            (("heat storage", "heat network"), "invest")
+        ]
 
     invest_cost = (
         spec_inv_gas_boiler * cap_gas_boiler
@@ -259,30 +277,55 @@ def solve_case(
     )
 
     operation_cost = (
-        var_cost_gas_boiler * flow_sum(data_heat_bus, (("gas boiler", "heat network"), "flow"))
-        + cost_sum(data["gas price"], data_gas_bus, (("gas network", "gas boiler"), "flow"))
-        + var_cost_heat_pump * flow_sum(data_heat_bus, (("heat pump", "heat network"), "flow"))
-        + cost_sum(data["el_spot_price"], data_el_bus, (("electricity network", "heat pump"), "flow"))
-        + var_cost_storage * flow_sum(data_heat_bus, (("heat storage", "heat network"), "flow"))
-        + var_cost_storage * flow_sum(data_heat_bus, (("heat network", "heat storage"), "flow"))
+        var_cost_gas_boiler
+        * flow_sum(data_heat_bus, (("gas boiler", "heat network"), "flow"))
+        + cost_sum(
+            data["gas price"],
+            data_gas_bus,
+            (("gas network", "gas boiler"), "flow"),
+        )
+        + var_cost_heat_pump
+        * flow_sum(data_heat_bus, (("heat pump", "heat network"), "flow"))
+        + cost_sum(
+            data["el_spot_price"],
+            data_el_bus,
+            (("electricity network", "heat pump"), "flow"),
+        )
+        + var_cost_storage
+        * flow_sum(data_heat_bus, (("heat storage", "heat network"), "flow"))
+        + var_cost_storage
+        * flow_sum(data_heat_bus, (("heat network", "heat storage"), "flow"))
     )
 
-    heat_produced = data_heat_bus[(("heat network", "heat sink"), "flow")].sum()
+    heat_produced = data_heat_bus[
+        (("heat network", "heat sink"), "flow")
+    ].sum()
 
-    total_co2 = (
-        co2_gas * flow_sum(data_gas_bus, (("gas network", "gas boiler"), "flow"))
-        + co2_el * flow_sum(data_el_bus, (("electricity network", "heat pump"), "flow"))
+    total_co2 = co2_gas * flow_sum(
+        data_gas_bus, (("gas network", "gas boiler"), "flow")
+    ) + co2_el * flow_sum(
+        data_el_bus, (("electricity network", "heat pump"), "flow")
     )
 
     lcoh = LCOH(invest_cost, operation_cost, heat_produced)
 
-    e_gas_boiler = flow_sum(data_heat_bus, (("gas boiler", "heat network"), "flow"))
-    e_heat_pump = flow_sum(data_heat_bus, (("heat pump", "heat network"), "flow"))
-    e_storage_in = flow_sum(data_heat_bus, (("heat network", "heat storage"), "flow"))
-    e_storage_out = flow_sum(data_heat_bus, (("heat storage", "heat network"), "flow"))
+    e_gas_boiler = flow_sum(
+        data_heat_bus, (("gas boiler", "heat network"), "flow")
+    )
+    e_heat_pump = flow_sum(
+        data_heat_bus, (("heat pump", "heat network"), "flow")
+    )
+    e_storage_in = flow_sum(
+        data_heat_bus, (("heat network", "heat storage"), "flow")
+    )
+    e_storage_out = flow_sum(
+        data_heat_bus, (("heat storage", "heat network"), "flow")
+    )
 
     data_heat_storage = (
-        solph.views.node(results, "heat storage")["sequences"] if use_storage else None
+        solph.views.node(results, "heat storage")["sequences"]
+        if use_storage
+        else None
     )
 
     return {
@@ -364,14 +407,26 @@ def plot_dispatch(res):
     fig_dispatch.savefig(f"dispatch_{slug}.png", dpi=150)
     fig_storage.savefig(f"storage_content_{slug}.png", dpi=150)
 
-    dispatch_df = pd.DataFrame({
-        "gas_boiler": data_heat_bus[(("gas boiler", "heat network"), "flow")],
-        "heat_pump": data_heat_bus[(("heat pump", "heat network"), "flow")],
-        "storage_discharge": data_heat_bus[(("heat storage", "heat network"), "flow")],
-        "storage_charge": data_heat_bus[(("heat network", "heat storage"), "flow")],
-        "heat_demand": data_heat_bus[(("heat network", "heat sink"), "flow")],
-        "gas_price": res["_gas_price"],
-    })
+    dispatch_df = pd.DataFrame(
+        {
+            "gas_boiler": data_heat_bus[
+                (("gas boiler", "heat network"), "flow")
+            ],
+            "heat_pump": data_heat_bus[
+                (("heat pump", "heat network"), "flow")
+            ],
+            "storage_discharge": data_heat_bus[
+                (("heat storage", "heat network"), "flow")
+            ],
+            "storage_charge": data_heat_bus[
+                (("heat network", "heat storage"), "flow")
+            ],
+            "heat_demand": data_heat_bus[
+                (("heat network", "heat sink"), "flow")
+            ],
+            "gas_price": res["_gas_price"],
+        }
+    )
     dispatch_df["balance"] = (
         dispatch_df["gas_boiler"]
         + dispatch_df["heat_pump"]
@@ -392,13 +447,25 @@ def write_combitimetable(res, filename=None):
     in the existing dispatch_combitimetable.txt.
     """
     data_heat_bus = res["_data_heat_bus"]
-    df = pd.DataFrame({
-        "heat_pump":         data_heat_bus[(("heat pump", "heat network"), "flow")],
-        "gas_boiler":        data_heat_bus[(("gas boiler", "heat network"), "flow")],
-        "storage_charge":    data_heat_bus[(("heat network", "heat storage"), "flow")],
-        "storage_discharge": data_heat_bus[(("heat storage", "heat network"), "flow")],
-        "heat_demand":       data_heat_bus[(("heat network", "heat sink"), "flow")],
-    }).ffill()
+    df = pd.DataFrame(
+        {
+            "heat_pump": data_heat_bus[
+                (("heat pump", "heat network"), "flow")
+            ],
+            "gas_boiler": data_heat_bus[
+                (("gas boiler", "heat network"), "flow")
+            ],
+            "storage_charge": data_heat_bus[
+                (("heat network", "heat storage"), "flow")
+            ],
+            "storage_discharge": data_heat_bus[
+                (("heat storage", "heat network"), "flow")
+            ],
+            "heat_demand": data_heat_bus[
+                (("heat network", "heat sink"), "flow")
+            ],
+        }
+    ).ffill()
 
     watts = df * 1e6
     seconds = (df.index - df.index[0]).total_seconds().astype("int64")
@@ -414,13 +481,17 @@ def write_combitimetable(res, filename=None):
             f" {res['cap_storage_mwh']:.0f} MWh / gas boiler"
             f" {res['cap_gas_boiler_mw']:.1f} MW\n"
         )
-        f.write(f"# LCOH {res['lcoh']:.3f} EUR/MWh, total CO2 {res['co2']:.1f} tCO2\n")
+        f.write(
+            f"# LCOH {res['lcoh']:.3f} EUR/MWh, total CO2 {res['co2']:.1f} tCO2\n"
+        )
         f.write("# col 1: time              [s]\n")
         f.write("# col 2: heat pump         [W]\n")
         f.write("# col 3: gas boiler        [W]\n")
         f.write("# col 4: storage charge    [W]   heat into the store\n")
         f.write("# col 5: storage discharge [W]   heat out of the store\n")
-        f.write("# col 6: heat demand       [W]   = col2 + col3 + col5 - col4\n")
+        f.write(
+            "# col 6: heat demand       [W]   = col2 + col3 + col5 - col4\n"
+        )
         f.write(f"double dispatch({len(watts)},6)\n")
         for t, (_, row) in zip(seconds, watts.iterrows()):
             values = "  ".join(f"{v:.3f}" for v in row)
@@ -442,16 +513,22 @@ co2_prices = [0, 20, 50, 100, 200, 400]
 # one configuration is possible, so it is left at 0).
 print("\nSolving reference case: gas boiler only")
 boiler_only = solve_case(
-    data, co2_price=0,
-    use_gas_boiler=True, use_heat_pump=False, use_storage=False,
+    data,
+    co2_price=0,
+    use_gas_boiler=True,
+    use_heat_pump=False,
+    use_storage=False,
     case_label="gas boiler only",
 )
 print_sizing_bar(boiler_only)
 
 print("\nSolving reference case: heat pump only")
 hp_only = solve_case(
-    data, co2_price=0,
-    use_gas_boiler=False, use_heat_pump=True, use_storage=False,
+    data,
+    co2_price=0,
+    use_gas_boiler=False,
+    use_heat_pump=True,
+    use_storage=False,
     case_label="heat pump only",
 )
 print_sizing_bar(hp_only)
@@ -465,8 +542,11 @@ print_sizing_bar(hp_only)
 # point -- the cost-optimal design -- is all there is to show.
 print("\nSolving heat pump + storage: cost-optimal design")
 hp_storage_opt = solve_case(
-    data, co2_price=0,
-    use_gas_boiler=False, use_heat_pump=True, use_storage=True,
+    data,
+    co2_price=0,
+    use_gas_boiler=False,
+    use_heat_pump=True,
+    use_storage=True,
     case_label="HP+sto optimum",
 )
 print_sizing_bar(hp_storage_opt)
@@ -476,8 +556,11 @@ full_sweep = []
 for cp in co2_prices:
     print(f"\nSolving full system, lambda = {cp} €/tCO2")
     res = solve_case(
-        data, co2_price=cp,
-        use_gas_boiler=True, use_heat_pump=True, use_storage=True,
+        data,
+        co2_price=cp,
+        use_gas_boiler=True,
+        use_heat_pump=True,
+        use_storage=True,
         case_label=f"full λ={cp}",
     )
     full_sweep.append(res)
@@ -514,11 +597,15 @@ _all_cases = [boiler_only, hp_only, hp_storage_opt] + full_sweep
 _co2 = [c["co2"] for c in _all_cases]
 _lcoh = [c["lcoh"] for c in _all_cases]
 
-XLIM = (min(_co2) - 0.06 * (max(_co2) - min(_co2)),
-        max(_co2) + 0.06 * (max(_co2) - min(_co2)))
+XLIM = (
+    min(_co2) - 0.06 * (max(_co2) - min(_co2)),
+    max(_co2) + 0.06 * (max(_co2) - min(_co2)),
+)
 # Extra headroom below so the lowest-cost points sit clear of the axis.
-YLIM = (min(_lcoh) - 0.18 * (max(_lcoh) - min(_lcoh)),
-        max(_lcoh) + 0.12 * (max(_lcoh) - min(_lcoh)))
+YLIM = (
+    min(_lcoh) - 0.18 * (max(_lcoh) - min(_lcoh)),
+    max(_lcoh) + 0.12 * (max(_lcoh) - min(_lcoh)),
+)
 
 # Plot 3 instead uses limits fixed identically in step2c_adv_super.py, _el.py
 # and _eff.py, so that one figure can be read straight across the scenarios.
@@ -542,8 +629,15 @@ def style_pareto(ax, xlim=XLIM, ylim=YLIM):
     # Bottom-left: with the shared limits the bottom-right corner is occupied by
     # the gas-boiler-only anchor in the half-price-gas scenario.
     ax.text(
-        0.01, 0.02, SIZE_NOTE, transform=ax.transAxes,
-        fontsize=7.5, style="italic", color="0.35", va="bottom", ha="left",
+        0.01,
+        0.02,
+        SIZE_NOTE,
+        transform=ax.transAxes,
+        fontsize=7.5,
+        style="italic",
+        color="0.35",
+        va="bottom",
+        ha="left",
     )
 
 
@@ -561,23 +655,38 @@ def size_label(c):
 
 def annotate_case(ax, c, dx=9, dy=-3, ha="left"):
     ax.annotate(
-        size_label(c), (c["co2"], c["lcoh"]),
-        textcoords="offset points", xytext=(dx, dy), fontsize=7.5, ha=ha,
+        size_label(c),
+        (c["co2"], c["lcoh"]),
+        textcoords="offset points",
+        xytext=(dx, dy),
+        fontsize=7.5,
+        ha=ha,
         # Backing so the iso-cost line in plot 3 -- which runs through the gas
         # boiler anchor at exactly this height -- does not strike the label out.
-        bbox=dict(boxstyle="square,pad=0.15", facecolor="white",
-                  edgecolor="none"),
+        bbox=dict(
+            boxstyle="square,pad=0.15", facecolor="white", edgecolor="none"
+        ),
     )
 
 
 def plot_anchors(ax, annotate=False):
     ax.scatter(
-        boiler_only["co2"], boiler_only["lcoh"],
-        label="gas boiler only", marker="s", s=130, color="#EC6707", zorder=4,
+        boiler_only["co2"],
+        boiler_only["lcoh"],
+        label="gas boiler only",
+        marker="s",
+        s=130,
+        color="#EC6707",
+        zorder=4,
     )
     ax.scatter(
-        hp_only["co2"], hp_only["lcoh"],
-        label="heat pump only", marker="^", s=130, color="#B54036", zorder=4,
+        hp_only["co2"],
+        hp_only["lcoh"],
+        label="heat pump only",
+        marker="^",
+        s=130,
+        color="#B54036",
+        zorder=4,
     )
     if annotate:
         # The boiler anchor sits at the right edge, so its label goes to the left.
@@ -594,9 +703,15 @@ def plot_hp_storage_opt(ax, annotate=True, hollow=False):
     """
     fill = "none" if hollow else "#00395B"
     ax.scatter(
-        hp_storage_opt["co2"], hp_storage_opt["lcoh"],
-        label="heat pump + storage (single-objective)", marker="o", s=110,
-        facecolors=fill, edgecolors="#00395B", linewidths=1.8, zorder=4,
+        hp_storage_opt["co2"],
+        hp_storage_opt["lcoh"],
+        label="heat pump + storage (single-objective)",
+        marker="o",
+        s=110,
+        facecolors=fill,
+        edgecolors="#00395B",
+        linewidths=1.8,
+        zorder=4,
     )
     if annotate:
         annotate_case(ax, hp_storage_opt, dx=11)
@@ -610,9 +725,11 @@ def pareto_front(cases):
     single-technology anchors drop out on their own.
     """
     front = [
-        c for c in cases
+        c
+        for c in cases
         if not any(
-            o["co2"] <= c["co2"] and o["lcoh"] <= c["lcoh"]
+            o["co2"] <= c["co2"]
+            and o["lcoh"] <= c["lcoh"]
             and (o["co2"] < c["co2"] or o["lcoh"] < c["lcoh"])
             for o in cases
         )
@@ -632,18 +749,28 @@ def plot_pareto_line(ax, cases, extend_right=False):
         xs.append(XLIM3[1])
         ys.append(ys[-1])
     ax.plot(
-        xs, ys,
-        color="black", linestyle="--", linewidth=1.3, zorder=2,
+        xs,
+        ys,
+        color="black",
+        linestyle="--",
+        linewidth=1.3,
+        zorder=2,
         label="Pareto front",
     )
     return front
 
 
-def plot_sweep(ax, cases, label, marker, color, annotate=lambda c: f"{c['co2_price']:.0f}"):
+def plot_sweep(
+    ax, cases, label, marker, color, annotate=lambda c: f"{c['co2_price']:.0f}"
+):
     ax.scatter(
         [c["co2"] for c in cases],
         [c["lcoh"] for c in cases],
-        label=label, marker=marker, s=70, color=color, zorder=3,
+        label=label,
+        marker=marker,
+        s=70,
+        color=color,
+        zorder=3,
     )
     if annotate is None:  # caller places the labels itself
         return
@@ -651,7 +778,9 @@ def plot_sweep(ax, cases, label, marker, color, annotate=lambda c: f"{c['co2_pri
         ax.annotate(
             annotate(c),
             (c["co2"], c["lcoh"]),
-            textcoords="offset points", xytext=(6, 4), fontsize=7,
+            textcoords="offset points",
+            xytext=(6, 4),
+            fontsize=7,
         )
 
 
@@ -679,11 +808,16 @@ fig3, ax3 = plt.subplots(figsize=(9, 6))
 plot_anchors(ax3, annotate=True)
 plot_hp_storage_opt(ax3, annotate=False, hollow=True)
 plot_sweep(
-    ax3, full_sweep, "heat pump + storage + gas boiler (multi-objective)",
-    "D", "#7A9A01", annotate=None,
+    ax3,
+    full_sweep,
+    "heat pump + storage + gas boiler (multi-objective)",
+    "D",
+    "#7A9A01",
+    annotate=None,
 )
 front = plot_pareto_line(
-    ax3, [boiler_only, hp_only, hp_storage_opt] + list(full_sweep),
+    ax3,
+    [boiler_only, hp_only, hp_storage_opt] + list(full_sweep),
     extend_right=True,
 )
 
@@ -697,15 +831,21 @@ cluster = sorted(
 )
 for i, c in enumerate(cluster):
     ax3.annotate(
-        size_label(c), (c["co2"], c["lcoh"]),
-        xytext=(4600, 20.2 - 0.5 * i), textcoords="data",
-        fontsize=7.5, va="center", ha="left",
-        arrowprops=dict(arrowstyle="-", color="0.6", linewidth=0.6,
-                        shrinkA=0, shrinkB=4),
+        size_label(c),
+        (c["co2"], c["lcoh"]),
+        xytext=(4600, 20.2 - 0.5 * i),
+        textcoords="data",
+        fontsize=7.5,
+        va="center",
+        ha="left",
+        arrowprops=dict(
+            arrowstyle="-", color="0.6", linewidth=0.6, shrinkA=0, shrinkB=4
+        ),
         # Opaque backing: the iso-cost line below runs straight through this
         # column and would otherwise strike a label out.
-        bbox=dict(boxstyle="square,pad=0.15", facecolor="white",
-                  edgecolor="none"),
+        bbox=dict(
+            boxstyle="square,pad=0.15", facecolor="white", edgecolor="none"
+        ),
     )
 
 annotate_case(ax3, next(c for c in full_sweep if c["co2_price"] == 0))
@@ -716,17 +856,29 @@ fig3.tight_layout()
 # -------------------------------------------------------------------------
 # Summary table over every solved case
 # -------------------------------------------------------------------------
-for fig, name in ((fig1, "pareto_1_anchors"), (fig2, "pareto_2_hp_storage"), (fig3, "pareto_3_full")):
+for fig, name in (
+    (fig1, "pareto_1_anchors"),
+    (fig2, "pareto_2_hp_storage"),
+    (fig3, "pareto_3_full"),
+):
     fig.savefig(f"{name}.png", dpi=150)
 
 df = pd.DataFrame([boiler_only, hp_only, hp_storage_opt] + full_sweep)
 print("\nSummary:")
 print(
-    df[[
-        "case_label", "co2_price",
-        "cap_gas_boiler_mw", "cap_heat_pump_mw", "cap_storage_mwh",
-        "lcoh", "co2",
-    ]].round(3).to_string(index=False)
+    df[
+        [
+            "case_label",
+            "co2_price",
+            "cap_gas_boiler_mw",
+            "cap_heat_pump_mw",
+            "cap_storage_mwh",
+            "lcoh",
+            "co2",
+        ]
+    ]
+    .round(3)
+    .to_string(index=False)
 )
 
 plt.show()
