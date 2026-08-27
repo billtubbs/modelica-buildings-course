@@ -82,10 +82,30 @@ def print_sizing_bar(res):
 
     print(f"\nCase = {res['case_label']}")
     sizing_rows = [
-        ("Gas boiler ", res["cap_gas_boiler_mw"], "MW", res["cap_gas_boiler_mw"]),
-        ("Heat pump  ", res["cap_heat_pump_mw"], "MW", res["cap_heat_pump_mw"]),
-        ("Storage (E)", res["cap_storage_mwh"], "MWh", res["cap_storage_mwh"] / 10),
-        ("Storage (P)", res["cap_storage_out_mw"], "MW", res["cap_storage_out_mw"]),
+        (
+            "Gas boiler ",
+            res["cap_gas_boiler_mw"],
+            "MW",
+            res["cap_gas_boiler_mw"],
+        ),
+        (
+            "Heat pump  ",
+            res["cap_heat_pump_mw"],
+            "MW",
+            res["cap_heat_pump_mw"],
+        ),
+        (
+            "Storage (E)",
+            res["cap_storage_mwh"],
+            "MWh",
+            res["cap_storage_mwh"] / 10,
+        ),
+        (
+            "Storage (P)",
+            res["cap_storage_out_mw"],
+            "MW",
+            res["cap_storage_out_mw"],
+        ),
     ]
     for label, value, unit, bar_value in sizing_rows:
         print(f"{label} ({value:.1f} {unit}): {bar(bar_value)}")
@@ -177,7 +197,9 @@ def solve_case(
         inputs={
             heat_bus: solph.flows.Flow(
                 nominal_capacity=data["heat demand"].max(),
-                fix=(data["heat demand"] / data["heat demand"].max()),
+                fix=(data["heat demand"] / data["heat demand"].max()).iloc[
+                    :-1
+                ],
             )
         },
     )
