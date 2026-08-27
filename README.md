@@ -28,6 +28,7 @@ This repo uses a conda environment (`environment.yaml`) to install Python plus t
 - Python 3.11
 - [CBC solver](https://github.com/coin-or/Cbc) (`coincbc`, via conda-forge)
 - [oemof.solph](https://oemof-solph.readthedocs.io/)
+- [Pyomo](https://www.pyomo.org/) (used directly for custom MILP constraints)
 - [Modelon Impact Client](https://modelon-impact-client.readthedocs.io/en/latest/index.html)
 - ipython, jupyter, numpy, matplotlib, pandas, scipy, casadi, pyyaml
 - pytest (for running tests)
