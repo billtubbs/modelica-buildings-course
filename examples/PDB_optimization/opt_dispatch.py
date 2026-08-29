@@ -31,12 +31,21 @@ both cases.
 Assumptions / things to check when running this:
     * FIX_CAP_* below must be filled in from a solved design (e.g. the
       lambda=20 full-system case from the capacity-sizing sweep script).
-    * The persistence forecast is deliberately the simplest possible
-      (flat: value(t+k) = value(t) for every k inside the look-ahead
-      window). This is a strong assumption and is expected to make the
-      causal case look considerably worse than perfect foresight,
-      especially for the storage, which exists specifically to exploit
-      future price/demand information it does not have here.
+    * The forecast for the causal case is a REPEATING PROFILE: the pattern
+      of the most-recently-known block of hours (n_known, ideally a full
+      day) is tiled forward to fill the rest of the look-ahead window,
+      rather than a single flat value. This still only ever uses real,
+      already-observed data (see make_persistence_forecast), but captures
+      the diurnal demand cycle -- a flat forecast anchored to a single
+      hour (e.g. a re-solve at midnight) badly underestimates a later
+      daily peak, which was measured here to make a storage reserve
+      target based on it look unnecessary right up until an actual
+      shortfall. This is still a simplifying assumption (it assumes
+      "tomorrow looks like the pattern I just observed"), and is expected
+      to make the causal case look considerably worse than perfect
+      foresight for genuinely unanticipated multi-day events (e.g. a cold
+      snap that gets colder each day), since the storage exists
+      specifically to exploit future information it does not have here.
     * A causal operator can, in principle, run into a window where the
       fixed hardware genuinely cannot meet demand (e.g. the storage was
       left empty by an earlier decision made under a bad forecast, right
@@ -82,13 +91,25 @@ Outputs:
     A summary table is also printed to the console.
 """
 
-# TODO:
-#    1. Change forecast values to repeating 24-hour profiles
-#    2. Incentivise a minimum end-of-horizon storage quantity during planning
-#    3. Lengthen moving horizon length
-#    4. Start both cases with the same initial storage amount
-#    5. Remove the check of minimum storage quantity
-#    6. Check all cost factors and other parameters match opt_step1.py
+# Changelog (was a TODO list; all items addressed):
+#    1. DONE -- forecast now uses repeating 24-hour profiles, not flat
+#       persistence (see make_persistence_forecast).
+#    2. DONE -- a minimum end-of-horizon (well, end-of-CONTROL_STEP)
+#       storage target now incentivizes planning ahead (see
+#       terminal_reserve_target_mwh and BELIEF_HORIZON_EXTRA_HOURS).
+#    3. TESTED, NOT ADOPTED -- lengthening HORIZON to 72 or 96 hours gave
+#       IDENTICAL results to 48 (see HORIZON's comment for why); left at
+#       48 since a longer horizon has a real compute cost for no benefit
+#       under this forecast method.
+#    4. ALREADY DONE -- both cases start from the same initial storage
+#       amount (perfect foresight's own optimal start-of-year SOC, reused
+#       to seed the causal case; see run_perfect_foresight/__main__).
+#    5. DONE -- the hard min_storage_level bound and its clamping logic
+#       were removed (measured to make things worse; superseded by the
+#       soft terminal reserve target from item 2).
+#    6. CONFIRMED -- all cost/technical parameters (COP, efficiencies,
+#       specific investment costs, CO2 factors, storage loss rate, and the
+#       epc/LCOH discount-rate defaults) match the capacity-sizing script.
 
 from pathlib import Path
 
@@ -167,6 +188,18 @@ CO2_PRICE = 20
 
 # Rolling-horizon settings for the causal case.
 HORIZON = 48  # hours the causal solve "sees" ahead at each re-solve
+# Tested lengthening this to 72 and 96 hours -- gave IDENTICAL results
+# (129.410 MWh unserved, 46 hours, both times) to HORIZON=48. This makes
+# sense given how the forecast works: make_persistence_forecast tiles the
+# SAME single observed day forward repeatedly, so a longer horizon just
+# shows the LP more repetitions of that identical day, not any new
+# information -- and the terminal reserve target is keyed to CONTROL_STEP,
+# not HORIZON, so it's unaffected too. A longer horizon would only help if
+# paired with a forecast that actually carries new information further
+# out (e.g. a real multi-day weather forecast, or extrapolating a trend
+# across several recently-observed days rather than tiling just the last
+# one) -- with the current forecast, keep this at the shorter/cheaper
+# value since there is no benefit to raising it.
 CONTROL_STEP = 24  # hours actually implemented before re-solving
 # N_KNOWN MUST equal CONTROL_STEP: every hour that gets implemented (kept
 # as "what actually happened") must be based on data that was genuinely
@@ -179,26 +212,41 @@ CONTROL_STEP = 24  # hours actually implemented before re-solving
 # (58,129 MWh vs the true 66,486 MWh) until this was fixed.
 N_KNOWN = CONTROL_STEP
 
-# Soft storage reserve target for the CAUSAL case only (perfect foresight is
-# left unconstrained -- it already achieves 0 unserved heat). Intent: stop
-# the causal controller's flat persistence forecast from fully draining the
-# tank on routine days for marginal cost savings, leaving nothing in
-# reserve when an unanticipated multi-day demand event hits.
+# Soft storage RESERVE for the CAUSAL case only (perfect foresight is left
+# unconstrained -- it already achieves 0 unserved heat). Intent: stop the
+# causal controller's forecast-driven dispatch from fully draining the
+# tank within its own planning horizon, leaving nothing in reserve for
+# what happens right after the horizon ends -- the classic finite-horizon
+# MPC "no terminal cost" failure mode.
 #
-# This was tried first as a HARD bound (oemof's native min_storage_level)
-# and measured to make things WORSE (188.7 MWh unserved vs. 183.5 MWh
-# without any floor) -- storage hit exactly the floor during the actual
-# emergency and got stuck there, unable to draw down further even though
-# doing so would have reduced the shortfall. A SOFT target fixes this: it's
-# a cost penalty for dipping below the target (added directly to the Pyomo
-# objective, since oemof has no native soft-storage-level feature), not a
-# hard limit -- the storage is always free to go lower if that's cheaper
-# than the alternative. The penalty must sit well above normal generation
-# costs (~1-30 EUR/MWh here) so the model actually bothers keeping the
-# reserve day-to-day, but far below VOLL_COST_EUR_PER_MWH (10,000) so a
-# genuine emergency always prefers dipping into the reserve over accepting
-# unserved heat.
-SOFT_RESERVE_TARGET_LEVEL = 0.15  # 15% of capacity
+# This is a genuine MPC TERMINAL target, computed fresh at every re-solve
+# from the worst hour of the same real data the controller has just
+# observed, held flat (see terminal_reserve_target_mwh): "if conditions
+# this severe continued a bit further than my visible horizon, how much
+# would I need left in the tank by the end of that horizon?" This is
+# causal (uses only currently-observable information, never the real
+# future) and self-adapting (higher target during an observed cold snap,
+# near-zero during mild weather) rather than one fixed number applied
+# uniformly all year. Deliberately more conservative than the repeating
+# profile used for actual dispatch decisions (see
+# terminal_reserve_target_mwh's docstring for why: a target based on the
+# realistic repeating shape, including its low hours, was measured to
+# perform worse).
+#
+# A flat, hand-picked target (15% of capacity, at every hour in the
+# horizon) was tried first and measured to help (138.0 MWh unserved vs.
+# 183.5 MWh with no reserve at all), but the target was arbitrary and
+# didn't adapt to how severe the visible forecast actually looked; a HARD
+# bound (oemof's native min_storage_level) was tried before that and
+# measured to make things WORSE (188.7 MWh unserved) since the storage got
+# stuck exactly at the floor during the real emergency, unable to draw
+# down further even though doing so would have helped.
+#
+# BELIEF_HORIZON_EXTRA_HOURS: how much further past the actual optimization
+# horizon (HORIZON) the observed pattern is extended, PURELY to compute
+# the terminal target -- these extra hours are never part of the LP's own
+# decision variables, only of the target calculation.
+BELIEF_HORIZON_EXTRA_HOURS = 24
 SOFT_RESERVE_PENALTY_EUR_PER_MWH = 50
 
 # Storage initial condition: NOT hard-coded. The combined converter capacity
@@ -268,9 +316,9 @@ def solve_dispatch_window(
     max_heat_demand,
     initial_storage_level,
     balanced,
-    min_storage_level=0.0,
-    soft_reserve_level=None,
-    soft_reserve_penalty_eur_per_mwh=None,
+    terminal_reserve_mwh=None,
+    terminal_reserve_penalty_eur_per_mwh=None,
+    terminal_reserve_position=None,
 ):
     """Solve a fixed-capacity dispatch LP over one window of data.
 
@@ -286,21 +334,31 @@ def solve_dispatch_window(
     ``storage_content.iloc[0]`` is the state at the start of the window and
     ``storage_content.iloc[k]`` is the state after ``k`` intervals.
 
-    ``min_storage_level`` (fraction of ``cap_storage``, default 0.0 = no
-    floor) is passed straight to oemof's GenericStorage as a HARD bound --
-    the storage literally cannot discharge below it, even in a genuine
-    emergency where using that last reserve would reduce unserved heat.
-    Measured to make things WORSE here (see SOFT_RESERVE_TARGET_LEVEL's
-    docstring) -- kept available but not used by default.
+    ``terminal_reserve_mwh``/``terminal_reserve_penalty_eur_per_mwh`` (both
+    None by default = no terminal reserve) add a cost penalty, directly to
+    the Pyomo objective, for the storage's level at ONE specific timepoint
+    in this window -- `terminal_reserve_position` (defaulting to the
+    window's last timepoint if not given) -- falling below
+    `terminal_reserve_mwh`. This is a genuine MPC terminal cost, not a
+    target applied to every hour, and NOT a hard bound: the storage can
+    still end lower than this if that's genuinely cheaper (e.g. avoiding
+    unserved heat during a real emergency). See
+    BELIEF_HORIZON_EXTRA_HOURS's docstring for how the target itself is
+    computed, and why the position matters: when the optimization horizon
+    is longer than what actually gets implemented before the next
+    re-solve, the target needs to sit at the END OF THE IMPLEMENTED
+    PORTION, not the end of the full lookahead -- a target placed beyond
+    the implemented portion can be satisfied by "catching up" during the
+    discarded-and-replanned tail of the window, with ~zero effect on what
+    actually gets kept (measured here: with the target at the full
+    horizon's end, results were identical to having no reserve at all).
 
-    ``soft_reserve_level``/``soft_reserve_penalty_eur_per_mwh`` (both None
-    by default = no soft reserve) add a cost penalty, directly to the
-    Pyomo objective, for the storage dipping below `soft_reserve_level`
-    (a fraction of `cap_storage`) at any timepoint -- NOT a hard bound, so
-    the storage can still go lower than this if that's genuinely cheaper
-    (e.g. avoiding unserved heat during a real emergency). See
-    SOFT_RESERVE_TARGET_LEVEL's docstring for why this replaced the hard
-    `min_storage_level` approach above.
+    A HARD bound (oemof's native min_storage_level) was tried before this
+    and measured to make things WORSE (188.7 MWh unserved vs. 183.5 MWh
+    without any floor): the storage hit exactly the floor during the
+    actual emergency and got stuck there, unable to draw down further even
+    though doing so would have reduced the shortfall -- so that approach
+    was removed rather than kept as unused dead code.
 
     An unlimited "unserved heat" source, penalized at VOLL_COST_EUR_PER_MWH,
     is always connected to the heat network (see that constant's docstring)
@@ -418,19 +476,8 @@ def solve_dispatch_window(
         },
         "balanced": balanced,
         "loss_rate": STORAGE_LOSS_RATE,
-        "min_storage_level": min_storage_level,
     }
     if initial_storage_level is not None:
-        if initial_storage_level < min_storage_level:
-            # Defensive only -- with the floor enforced above, a window's
-            # own storage_content should never end up below it, so this
-            # should not normally trigger. Clamp rather than let oemof
-            # reject an out-of-range initial level with an opaque error.
-            print(
-                f"  (initial_storage_level {initial_storage_level:.4f} "
-                f"below min_storage_level {min_storage_level}; clamping)"
-            )
-            initial_storage_level = min_storage_level
         storage_kwargs["initial_storage_level"] = initial_storage_level
     heat_storage = solph.components.GenericStorage(**storage_kwargs)
 
@@ -438,35 +485,38 @@ def solve_dispatch_window(
 
     model = solph.Model(es)
 
-    if soft_reserve_level is not None:
-        # Soft reserve: penalize (don't forbid) storage_content falling
-        # below `soft_reserve_level * cap_storage` at any timepoint. oemof
-        # has no native feature for this, so it's added directly as a
-        # Pyomo Var + Constraint + objective term on top of the built
-        # model. `reserve_deficit[t] >= target - storage_content[t]` with
-        # reserve_deficit >= 0 means the deficit is exactly
-        # max(0, target - storage_content[t]) at the optimum (never more,
-        # since anything above that only adds needless objective cost).
+    if terminal_reserve_mwh is not None:
+        # Terminal reserve: penalize (don't forbid) storage_content at ONE
+        # specific timepoint in this window falling below
+        # `terminal_reserve_mwh`. oemof has no native feature for this, so
+        # it's added directly as a Pyomo Var + Constraint + objective term
+        # on top of the built model. `reserve_deficit >= target -
+        # storage_content` with reserve_deficit >= 0 means the deficit is
+        # exactly max(0, target - storage_content) at the optimum (never
+        # more, since anything above that only adds needless objective
+        # cost).
         storage_content_var = model.GenericStorageBlock.storage_content
-        storage_keys = [k for k in storage_content_var if k[0] is heat_storage]
-        target_mwh = soft_reserve_level * cap_storage
-
-        model.reserve_deficit = po.Var(
-            storage_keys, within=po.NonNegativeReals
+        storage_keys = [
+            k for k in storage_content_var if k[0] is heat_storage
+        ]
+        position = (
+            terminal_reserve_position
+            if terminal_reserve_position is not None
+            else max(k[1] for k in storage_keys)
         )
+        terminal_key = next(k for k in storage_keys if k[1] == position)
 
-        def _reserve_rule(m, node, t):
-            return (
-                m.reserve_deficit[node, t]
-                >= target_mwh - storage_content_var[node, t]
-            )
-
+        # NOTE: a genuine scalar po.Var() breaks oemof's
+        # solph.processing.results() (a hashing issue in its internals
+        # when walking all Var objects) -- index it over a trivial
+        # single-element set instead.
+        model.reserve_deficit = po.Var([0], within=po.NonNegativeReals)
         model.reserve_deficit_constraint = po.Constraint(
-            storage_keys, rule=_reserve_rule
+            expr=model.reserve_deficit[0]
+            >= terminal_reserve_mwh - storage_content_var[terminal_key]
         )
         model.objective.expr += (
-            sum(model.reserve_deficit[k] for k in storage_keys)
-            * soft_reserve_penalty_eur_per_mwh
+            model.reserve_deficit[0] * terminal_reserve_penalty_eur_per_mwh
         )
 
     model.solve(solver="cbc", solve_kwargs={"tee": False})
@@ -483,6 +533,16 @@ def solve_dispatch_window(
             "than a capacity/storage shortfall -- check the model/data for "
             "this window directly (e.g. via test_solve_dispatch_window.py)."
         )
+
+    if terminal_reserve_mwh is not None:
+        # The LP is already solved -- all real flow/storage values are
+        # fixed. Remove the auxiliary terminal-reserve Var/Constraint
+        # before extracting results: solph.processing.results() walks
+        # every Var/Constraint in the model expecting oemof's own
+        # node-based key structure, and chokes on this custom addition
+        # otherwise.
+        model.del_component(model.reserve_deficit_constraint)
+        model.del_component(model.reserve_deficit)
 
     results = solph.processing.results(model)
     data_heat_bus = solph.views.node(results, "heat network")["sequences"]
@@ -564,8 +624,18 @@ def solve_dispatch_window(
 
 def make_persistence_forecast(data, t0, horizon, n_known=1):
     """Build a forecast window: real data for the first ``n_known`` steps,
-    then a flat persistence forecast (value held at the last known value)
-    for the remaining ``horizon + 1 - n_known`` steps.
+    then a REPEATING-PROFILE forecast for the remaining steps -- the
+    pattern of the ``n_known`` most-recently-known hours (ideally a full
+    day, i.e. n_known=24) is tiled forward to fill the rest of the
+    horizon, rather than holding flat at a single value.
+
+    This still only ever uses real, already-observed data (stays fully
+    causal), but is a materially better assumption than flat persistence:
+    a flat forecast anchored to a single hour is blind to the diurnal
+    demand cycle -- e.g. if `n_known` ends at midnight (a naturally low
+    hour), a flat forecast badly underestimates the day's actual peak a
+    few hours later. Tiling the whole observed pattern forward carries
+    that shape (including its peak) into the forecast instead.
 
     Returns a DataFrame with ``horizon + 1`` rows (boundaries for
     ``horizon`` dispatch intervals), indexed with the *real* timestamps
@@ -577,16 +647,104 @@ def make_persistence_forecast(data, t0, horizon, n_known=1):
     known = data.iloc[t0 : t0 + n_known].copy()
     n_forecast = len(idx) - len(known)
     if n_forecast > 0:
-        last_known_row = data.iloc[t0 + n_known - 1]
-        forecast_rows = pd.DataFrame(
-            [last_known_row.to_dict()] * n_forecast,
-            index=idx[len(known) :],
-        )
+        pattern = known.reset_index(drop=True)
+        n_pattern = len(pattern)
+        tiled_rows = [
+            pattern.iloc[i % n_pattern] for i in range(n_forecast)
+        ]
+        forecast_rows = pd.DataFrame(tiled_rows, index=idx[len(known) :])
         window = pd.concat([known, forecast_rows])
     else:
         window = known
     window.index = idx
     return window
+
+
+def minimum_required_storage(
+    demand, cap_gas_boiler, cap_heat_pump, cap_storage, loss_rate=STORAGE_LOSS_RATE
+):
+    """Backward pass: minimum storage level (MWh) required at the START of
+    each hour in `demand` to meet all remaining demand through the end of
+    the series, for a fixed-capacity design -- a pure feasibility question,
+    independent of cost. See min_storage_requirement.py for the full
+    standalone version (used there for the whole real year); this copy is
+    used here only over short, forecast-based windows to derive a causal
+    terminal reserve target -- see terminal_reserve_target_mwh.
+
+    Returns a Series indexed like `demand`.
+    """
+    firm_capacity_mw = cap_gas_boiler + cap_heat_pump
+    power_limit_mw = cap_storage / 24
+
+    n = len(demand)
+    min_required = pd.Series(index=demand.index, dtype=float)
+    required_next = 0.0
+    for k in range(n - 1, -1, -1):
+        d = demand.iloc[k]
+        if d <= firm_capacity_mw:
+            available_charge = min(power_limit_mw, firm_capacity_mw - d)
+            s_min = max(0.0, (required_next - available_charge) / (1 - loss_rate))
+        else:
+            discharge_needed = min(d - firm_capacity_mw, power_limit_mw)
+            s_min = (required_next + discharge_needed) / (1 - loss_rate)
+        s_min = min(s_min, cap_storage)
+        min_required.iloc[k] = s_min
+        required_next = s_min
+    return min_required
+
+
+def terminal_reserve_target_mwh(
+    data, t0, control_step, belief_extra_hours, cap_gas_boiler, cap_heat_pump, cap_storage
+):
+    """Causal terminal reserve target (MWh) for a re-solve starting at
+    `t0`, for the boundary at `control_step` hours from now (i.e. the end
+    of what will actually be IMPLEMENTED before the next re-solve -- not
+    necessarily the end of the LP's full lookahead horizon; see
+    solve_dispatch_window's terminal_reserve_position docstring for why
+    that distinction matters): "if conditions as severe as the worst hour
+    I've just actually observed continued for `belief_extra_hours` past
+    that boundary, how much would I need left in storage by the time it's
+    reached?"
+
+    Uses only the N_KNOWN real hours just observed (never the real future
+    demand), so this stays causal. IMPORTANTLY, this deliberately does NOT
+    reuse make_persistence_forecast's repeating-profile pattern: a
+    precautionary reserve target should stay conservative, and tiling the
+    full observed day (including its LOW hours) into the belief window
+    lets the backward calculation assume recharging opportunities during
+    those lows, which relaxes the target -- measured here to perform
+    worse (176.9 MWh unserved) than holding the day's PEAK flat for the
+    whole belief extension (129.2 MWh unserved), which has no such
+    recovery periods to lean on. The actual dispatch forecast (used for
+    real-time economic decisions, not this safety margin) is correctly
+    the more realistic repeating profile; this target calculation is
+    intentionally more pessimistic.
+    """
+    known = data["heat demand"].iloc[t0 : t0 + N_KNOWN]
+    reference_level = known.max()
+
+    # Near the very end of the year there may not be enough real timestamps
+    # left to build the full belief window; shrink it rather than error.
+    max_extra = max(0, len(data) - 1 - (t0 + control_step))
+    belief_extra_hours = min(belief_extra_hours, max_extra)
+
+    n_future = control_step + belief_extra_hours - len(known)
+    if n_future <= 0:
+        demand = known.iloc[: control_step + 1]
+    else:
+        demand = pd.concat(
+            [known, pd.Series([reference_level] * n_future)]
+        )
+    if len(demand) <= control_step:
+        # No room left for a belief extension (right at year-end) -- no
+        # further information to base a terminal target on.
+        return 0.0
+    min_required = minimum_required_storage(
+        demand, cap_gas_boiler, cap_heat_pump, cap_storage
+    )
+    # Position `control_step` in this extended series is exactly the
+    # boundary we want a target for.
+    return float(min_required.iloc[control_step])
 
 
 def report_unserved_heat(dispatch, label=""):
@@ -686,6 +844,15 @@ def run_causal_dispatch(
         window = make_persistence_forecast(
             data, t0, this_horizon, n_known=N_KNOWN
         )
+        terminal_target_mwh = terminal_reserve_target_mwh(
+            data,
+            t0,
+            this_control_step,
+            BELIEF_HORIZON_EXTRA_HOURS,
+            CAP_GAS_BOILER_MW,
+            CAP_HEAT_PUMP_MW,
+            CAP_STORAGE_MWH,
+        )
         dispatch, storage_content = solve_dispatch_window(
             window,
             CAP_GAS_BOILER_MW,
@@ -695,8 +862,9 @@ def run_causal_dispatch(
             max_heat_demand,
             storage_level,
             balanced=False,
-            soft_reserve_level=SOFT_RESERVE_TARGET_LEVEL,
-            soft_reserve_penalty_eur_per_mwh=SOFT_RESERVE_PENALTY_EUR_PER_MWH,
+            terminal_reserve_mwh=terminal_target_mwh,
+            terminal_reserve_penalty_eur_per_mwh=SOFT_RESERVE_PENALTY_EUR_PER_MWH,
+            terminal_reserve_position=this_control_step,
         )
 
         implemented_dispatch.append(dispatch.iloc[:this_control_step])
