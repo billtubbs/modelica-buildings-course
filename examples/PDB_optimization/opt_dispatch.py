@@ -78,8 +78,19 @@ Outputs:
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import oemof.solph as solph
 import pandas as pd
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    def tqdm(iterable, **kwargs):
+        print(
+            "(tqdm not installed -- install with `pip install tqdm` for a "
+            "progress bar; continuing without one.)"
+        )
+        return iterable
 
 DATA_DIR = Path("data")
 PLOT_DIR = Path("plots")
@@ -98,27 +109,47 @@ for directory in (DATA_DIR, PLOT_DIR, RESULTS_DIR):
 # ---------------------------------------------------------------------------
 SOLUTIONS = {
     "solution_1": {
-        "cap_gas_boiler_mw": 4.4,
-        "cap_heat_pump_mw": 10.6,
-        "cap_storage_mwh": 187.0,
-        "design_lcoh_eur_per_mwh": 18.9,
-        "design_co2_t": 3506,
+        # from "full λ=20" in the sizing sweep output
+        "cap_gas_boiler_mw": 4.419,
+        "cap_heat_pump_mw": 10.649,
+        "cap_storage_mwh": 187.176,
+        "design_lcoh_eur_per_mwh": 18.903,
+        "design_co2_t": 3506.820,
     },
     "solution_2": {
-        "cap_gas_boiler_mw": 10.2,
-        "cap_heat_pump_mw": 6.0,
-        "cap_storage_mwh": 98.6,
-        "design_lcoh_eur_per_mwh": 18.6,
-        "design_co2_t": 6860,
+        # from "full λ=0" in the sizing sweep output
+        "cap_gas_boiler_mw": 10.234,
+        "cap_heat_pump_mw": 5.985,
+        "cap_storage_mwh": 98.592,
+        "design_lcoh_eur_per_mwh": 18.626,
+        "design_co2_t": 6859.743,
     },
 }
 
 SELECTED_SOLUTION = "solution_1"   # change to "solution_2" to evaluate that design instead
 
+# Safety margin applied to all three fixed capacities. The exact LP-optimal
+# capacities are only available to 3 decimal places (as printed by the
+# sizing sweep), and this design has essentially zero slack in its annual
+# storage energy balance by construction ("optimal capacity" means no more
+# storage than exactly needed) -- so rounding the true value down by even a
+# fraction of a percent can make the *whole year* infeasible, even though
+# every individual hour is comfortably within capacity. This was confirmed
+# with test_solve_dispatch_window.py: the local window around the first
+# infeasible hour solves fine in isolation with a free start/end SOC, and
+# the shortfall there is tiny (0.033 MW against ~16 MW demand -- a 0.2% gap
+# at the single coldest, most storage-depleted hour of the year).
+# This margin is a documented workaround for that precision limit, not a
+# real hardware change. Set to 0.0 to test with the exact reported values.
+# For an exact (no-margin) fix instead, export the sizing run's Investment
+# results at full float precision (e.g. to a small JSON/CSV) and load them
+# here directly, rather than hand-copying the printed, rounded figures.
+CAPACITY_SAFETY_MARGIN = 0.002   # 0.2% headroom
+
 _design = SOLUTIONS[SELECTED_SOLUTION]
-CAP_GAS_BOILER_MW = _design["cap_gas_boiler_mw"]
-CAP_HEAT_PUMP_MW = _design["cap_heat_pump_mw"]
-CAP_STORAGE_MWH = _design["cap_storage_mwh"]
+CAP_GAS_BOILER_MW = _design["cap_gas_boiler_mw"] * (1 + CAPACITY_SAFETY_MARGIN)
+CAP_HEAT_PUMP_MW = _design["cap_heat_pump_mw"] * (1 + CAPACITY_SAFETY_MARGIN)
+CAP_STORAGE_MWH = _design["cap_storage_mwh"] * (1 + CAPACITY_SAFETY_MARGIN)
 
 # CO2 price [EUR/tCO2] used inside the dispatch cost minimization (i.e. the
 # carbon price the design above was actually optimized against). This
@@ -185,6 +216,7 @@ def solve_dispatch_window(
     max_heat_demand,
     initial_storage_level,
     balanced,
+    allow_shortfall=False,
 ):
     """Solve a fixed-capacity dispatch LP over one window of data.
 
@@ -199,6 +231,15 @@ def solve_dispatch_window(
     ``window`` (one value per boundary, in absolute MWh) -- so
     ``storage_content.iloc[0]`` is the state at the start of the window and
     ``storage_content.iloc[k]`` is the state after ``k`` intervals.
+
+    ``allow_shortfall=True`` is an infeasibility-diagnosis mode: it adds an
+    unlimited, heavily-penalized "emergency heat" source directly to the
+    heat network so the LP always solves, and the returned ``dispatch``
+    gets an extra ``emergency_shortfall`` column. Any hour where that
+    column is nonzero is an hour the fixed hardware genuinely cannot cover
+    from generation + storage alone -- i.e. the real cause of an
+    infeasibility. Never use this mode for an actual result, only to find
+    where/how large a shortfall is.
     """
     # Per-interval cost sequences need N values (one per dispatch interval),
     # matching the N-values-for-N+1-boundaries convention used everywhere
@@ -245,6 +286,17 @@ def solve_dispatch_window(
         },
     )
     es.add(gas_source, electricity_source, waste_heat_source, heat_sink)
+
+    if allow_shortfall:
+        # Unlimited, heavily-penalized source -- lets the LP always solve so
+        # the *pattern* of any remaining shortfall can be inspected.
+        emergency_source = solph.components.Source(
+            label="emergency heat",
+            outputs={
+                heat_bus: solph.flows.Flow(variable_costs=1e6)
+            },
+        )
+        es.add(emergency_source)
 
     gas_boiler = solph.components.Converter(
         label="gas boiler",
@@ -312,6 +364,13 @@ def solve_dispatch_window(
         model.solver_results["Solver"][0]["Termination condition"]
     )
     if term_condition != "optimal":
+        if allow_shortfall:
+            # Should not happen -- the emergency source should make this
+            # always feasible. If it still fails, something else is wrong.
+            raise RuntimeError(
+                "Diagnostic (allow_shortfall=True) solve still did not "
+                f"reach optimality (termination condition: {term_condition})."
+            )
         raise RuntimeError(
             f"Dispatch window starting at {window.index[0]} was not solved "
             f"to optimality (termination condition: {term_condition}). "
@@ -319,7 +378,9 @@ def solve_dispatch_window(
             "cannot meet the known heat demand given the storage state "
             "handed over from the previous window -- i.e. an earlier "
             "decision, made under an imperfect forecast, has left the "
-            "system unable to cope."
+            "system unable to cope. Re-run with allow_shortfall=True on "
+            "this same window to see exactly which hour(s) are short and "
+            "by how much."
         )
 
     results = solph.processing.results(model)
@@ -327,26 +388,62 @@ def solve_dispatch_window(
     data_heat_storage = solph.views.node(results, "heat storage")["sequences"]
 
     idx = window.index[:-1]
+    n = len(idx)
+
+    def _flow(key):
+        """Extract a flow column, truncated to the first `n` values.
+
+        oemof's returned flow sequences can come back at length N+1 (one
+        per time POINT, same convention as storage_content) rather than N
+        (one per interval) -- truncating defensively here avoids a pandas
+        length-mismatch error regardless of which convention this oemof
+        version/model configuration actually uses.
+        """
+        return data_heat_bus[key].to_numpy()[:n]
+
     dispatch = pd.DataFrame(
         {
-            "gas_boiler": data_heat_bus[
-                (("gas boiler", "heat network"), "flow")
-            ].to_numpy(),
-            "heat_pump": data_heat_bus[
-                (("heat pump", "heat network"), "flow")
-            ].to_numpy(),
-            "storage_discharge": data_heat_bus[
+            "gas_boiler": _flow((("gas boiler", "heat network"), "flow")),
+            "heat_pump": _flow((("heat pump", "heat network"), "flow")),
+            "storage_discharge": _flow(
                 (("heat storage", "heat network"), "flow")
-            ].to_numpy(),
-            "storage_charge": data_heat_bus[
+            ),
+            "storage_charge": _flow(
                 (("heat network", "heat storage"), "flow")
-            ].to_numpy(),
-            "heat_demand": data_heat_bus[
-                (("heat network", "heat sink"), "flow")
-            ].to_numpy(),
+            ),
+            "heat_demand": _flow((("heat network", "heat sink"), "flow")),
         },
         index=idx,
     )
+    if allow_shortfall:
+        dispatch["emergency_shortfall"] = _flow(
+            (("emergency heat", "heat network"), "flow")
+        )
+
+    # Sanity check the extraction itself: if the `[:n]` truncation above
+    # grabbed the wrong end of an N+1-length sequence (or grabbed the wrong
+    # sequence entirely), the heat balance below will be badly violated --
+    # catch that immediately rather than silently returning misaligned
+    # data.
+    balance = (
+        dispatch["gas_boiler"]
+        + dispatch["heat_pump"]
+        + dispatch["storage_discharge"]
+        - dispatch["storage_charge"]
+        - dispatch["heat_demand"]
+    )
+    if allow_shortfall:
+        balance = balance + dispatch["emergency_shortfall"]
+    max_imbalance = balance.abs().max()
+    if max_imbalance > 1e-3:
+        raise RuntimeError(
+            f"Heat balance check failed after extracting dispatch results "
+            f"(max imbalance {max_imbalance:.4f} MW at "
+            f"{balance.abs().idxmax()}). The flow-sequence truncation "
+            f"assumption in `_flow()` is likely misaligned for this oemof "
+            f"version -- inspect `data_heat_bus` directly (its raw shape "
+            f"and index) rather than trusting these dispatch values."
+        )
 
     # storage_content is defined at every TIME POINT (boundary), not every
     # interval -- i.e. one value per entry of `window.index` (N+1 values for
@@ -393,6 +490,55 @@ def make_persistence_forecast(data, t0, horizon, n_known=1):
     return window
 
 
+def diagnose_infeasibility(window, cap_gas_boiler, cap_heat_pump, cap_storage, co2_price, max_heat_demand, initial_storage_level, balanced):
+    """Re-solve a window with an unlimited penalized 'emergency heat' source
+    so the LP always solves, then report which hours needed it -- i.e. the
+    actual location(s) of an otherwise-opaque CBC infeasibility.
+    """
+    dispatch, _ = solve_dispatch_window(
+        window,
+        cap_gas_boiler,
+        cap_heat_pump,
+        cap_storage,
+        co2_price,
+        max_heat_demand,
+        initial_storage_level,
+        balanced,
+        allow_shortfall=True,
+    )
+    shortfall = dispatch["emergency_shortfall"]
+    short_mask = (shortfall > 1e-6).to_numpy()
+    n_short = int(short_mask.sum())
+    if n_short == 0:
+        print(
+            "Diagnostic solve found NO shortfall hours -- the infeasibility "
+            "is not a simple capacity shortfall (check balanced-year energy "
+            "accounting, or a units/sign issue elsewhere in the model)."
+        )
+        return dispatch
+
+    first_pos = int(np.flatnonzero(short_mask)[0])
+    first_ts = shortfall.index[first_pos]
+    print(
+        f"Diagnostic solve found {n_short} hour(s) with an unmet-demand "
+        f"shortfall, totalling {shortfall.sum():.2f} MWh, peak "
+        f"{shortfall.max():.3f} MW at {shortfall.idxmax()}."
+    )
+    print(
+        f"FIRST shortfall: time step {first_pos} of {len(shortfall)} "
+        f"(timestamp {first_ts}), shortfall {shortfall.iloc[first_pos]:.3f} MW."
+    )
+    context_lo = max(0, first_pos - 3)
+    context_hi = min(len(dispatch), first_pos + 4)
+    print(f"Dispatch around that time step (rows {context_lo}..{context_hi - 1}):")
+    print(
+        dispatch.iloc[context_lo:context_hi][
+            ["gas_boiler", "heat_pump", "storage_discharge", "storage_charge", "heat_demand", "emergency_shortfall"]
+        ].to_string()
+    )
+    return dispatch
+
+
 def run_perfect_foresight(data, max_heat_demand):
     """Single solve over the whole year with full knowledge of the future.
 
@@ -404,16 +550,30 @@ def run_perfect_foresight(data, max_heat_demand):
     SOC as a fraction of capacity (for seeding the causal case).
     """
     print("Solving perfect-foresight dispatch (single solve, full year)...")
-    dispatch, storage_content = solve_dispatch_window(
-        data,
-        CAP_GAS_BOILER_MW,
-        CAP_HEAT_PUMP_MW,
-        CAP_STORAGE_MWH,
-        CO2_PRICE,
-        max_heat_demand,
-        initial_storage_level=None,
-        balanced=True,
-    )
+    try:
+        dispatch, storage_content = solve_dispatch_window(
+            data,
+            CAP_GAS_BOILER_MW,
+            CAP_HEAT_PUMP_MW,
+            CAP_STORAGE_MWH,
+            CO2_PRICE,
+            max_heat_demand,
+            initial_storage_level=None,
+            balanced=True,
+        )
+    except RuntimeError:
+        print("Infeasible -- re-solving with an emergency heat source to locate the shortfall...")
+        diagnose_infeasibility(
+            data,
+            CAP_GAS_BOILER_MW,
+            CAP_HEAT_PUMP_MW,
+            CAP_STORAGE_MWH,
+            CO2_PRICE,
+            max_heat_demand,
+            initial_storage_level=None,
+            balanced=True,
+        )
+        raise
     initial_level = float(storage_content.iloc[0] / CAP_STORAGE_MWH)
     print(
         f"  optimal start-of-year storage level: {initial_level:.3f} "
@@ -434,6 +594,7 @@ def run_causal_dispatch(
 
     t0 = 0
     n_windows = 0
+    pbar = tqdm(total=n_total, desc="Causal dispatch", unit="hr")
     while t0 < n_total:
         this_horizon = min(horizon, n_total - t0)
         this_control_step = min(control_step, this_horizon)
@@ -441,16 +602,38 @@ def run_causal_dispatch(
         window = make_persistence_forecast(
             data, t0, this_horizon, n_known=N_KNOWN
         )
-        dispatch, storage_content = solve_dispatch_window(
-            window,
-            CAP_GAS_BOILER_MW,
-            CAP_HEAT_PUMP_MW,
-            CAP_STORAGE_MWH,
-            CO2_PRICE,
-            max_heat_demand,
-            storage_level,
-            balanced=False,
-        )
+        try:
+            dispatch, storage_content = solve_dispatch_window(
+                window,
+                CAP_GAS_BOILER_MW,
+                CAP_HEAT_PUMP_MW,
+                CAP_STORAGE_MWH,
+                CO2_PRICE,
+                max_heat_demand,
+                storage_level,
+                balanced=False,
+            )
+        except RuntimeError:
+            pbar.close()
+            print(
+                f"Causal dispatch infeasible at re-solve #{n_windows} "
+                f"(hours {t0}..{t0 + this_horizon - 1} of {n_total}, "
+                f"window starts {window.index[0]}, storage level handed in "
+                f"was {storage_level:.4f} = "
+                f"{storage_level * CAP_STORAGE_MWH:.2f} MWh)."
+            )
+            print("Re-solving this window with an emergency heat source to locate the shortfall...")
+            diagnose_infeasibility(
+                window,
+                CAP_GAS_BOILER_MW,
+                CAP_HEAT_PUMP_MW,
+                CAP_STORAGE_MWH,
+                CO2_PRICE,
+                max_heat_demand,
+                storage_level,
+                balanced=False,
+            )
+            raise
 
         implemented_dispatch.append(dispatch.iloc[:this_control_step])
         # storage_content.iloc[0] is the window's start (== previous window's
@@ -471,8 +654,8 @@ def run_causal_dispatch(
 
         t0 += this_control_step
         n_windows += 1
-        if n_windows % 20 == 0:
-            print(f"  ... causal dispatch: {t0}/{n_total} hours solved")
+        pbar.update(this_control_step)
+    pbar.close()
 
     print(f"Causal dispatch solved in {n_windows} re-solves.")
     full_dispatch = pd.concat(implemented_dispatch)
@@ -489,7 +672,19 @@ def evaluate_dispatch(dispatch, price_data):
     gas_price = price_data["gas price"].reindex(dispatch.index)
     el_price = price_data["el_spot_price"].reindex(dispatch.index)
 
-    gas_consumed = dispatch["gas_boiler"] / GAS_BOILER_EFFICIENCY
+    # NOTE: given how `conversion_factors={gas_bus: GAS_BOILER_EFFICIENCY}` is
+    # specified in the model (factor attached to the INPUT bus, output bus
+    # defaults to 1), oemof's Converter equation actually gives
+    # gas_consumed = heat_output * GAS_BOILER_EFFICIENCY (not divided). This
+    # was verified against the original sizing script's own printed "gas
+    # boiler only" case: heat_produced=66485.8 MWh * 0.95 * co2_gas(0.2)
+    # = 12632.3 tCO2, which matches its printed CO2 figure exactly. It also
+    # means this model implies gas-to-heat conversion >100% (1 MWh gas ->
+    # 1/0.95 MWh heat) -- physically backwards for "boiler efficiency", and
+    # worth revisiting in the original sizing script if that wasn't
+    # intended. This evaluation function must match the model as actually
+    # built, so it uses the same (as-built) relationship here.
+    gas_consumed = dispatch["gas_boiler"] * GAS_BOILER_EFFICIENCY
     electricity_consumed = dispatch["heat_pump"] / COP
 
     operation_cost = (
@@ -582,9 +777,10 @@ def plot_storage_comparison(storage_pf, storage_causal):
 
 if __name__ == "__main__":
     print(
-        f"Evaluating dispatch for '{SELECTED_SOLUTION}': "
-        f"gas boiler {CAP_GAS_BOILER_MW} MW / heat pump {CAP_HEAT_PUMP_MW} MW "
-        f"/ storage {CAP_STORAGE_MWH} MWh "
+        f"Evaluating dispatch for '{SELECTED_SOLUTION}' "
+        f"(+{CAPACITY_SAFETY_MARGIN * 100:.1f}% capacity safety margin): "
+        f"gas boiler {CAP_GAS_BOILER_MW:.4f} MW / heat pump "
+        f"{CAP_HEAT_PUMP_MW:.4f} MW / storage {CAP_STORAGE_MWH:.4f} MWh "
         f"(design-stage reference: LCOH {_design['design_lcoh_eur_per_mwh']} "
         f"EUR/MWh, CO2 {_design['design_co2_t']} t)"
     )
