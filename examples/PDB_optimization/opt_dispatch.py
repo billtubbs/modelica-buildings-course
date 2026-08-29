@@ -82,13 +82,21 @@ Outputs:
     A summary table is also printed to the console.
 """
 
+# TODO:
+#    1. Change forecast values to repeating 24-hour profiles
+#    2. Incentivise a minimum end-of-horizon storage quantity during planning
+#    3. Lengthen moving horizon length
+#    4. Start both cases with the same initial storage amount
+#    5. Remove the check of minimum storage quantity
+#    6. Check all cost factors and other parameters match opt_step1.py
+
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-import oemof.solph as solph
 import pandas as pd
 import pyomo.environ as po
+from oemof import solph
 from tqdm import tqdm
 
 DATA_DIR = Path("data")
@@ -440,12 +448,12 @@ def solve_dispatch_window(
         # max(0, target - storage_content[t]) at the optimum (never more,
         # since anything above that only adds needless objective cost).
         storage_content_var = model.GenericStorageBlock.storage_content
-        storage_keys = [
-            k for k in storage_content_var if k[0] is heat_storage
-        ]
+        storage_keys = [k for k in storage_content_var if k[0] is heat_storage]
         target_mwh = soft_reserve_level * cap_storage
 
-        model.reserve_deficit = po.Var(storage_keys, within=po.NonNegativeReals)
+        model.reserve_deficit = po.Var(
+            storage_keys, within=po.NonNegativeReals
+        )
 
         def _reserve_rule(m, node, t):
             return (
@@ -951,7 +959,10 @@ if __name__ == "__main__":
     # stitched dispatch are reflecting forecast values rather than what
     # genuinely happened (see the N_KNOWN == CONTROL_STEP requirement).
     true_annual_demand = data["heat demand"].iloc[:-1].sum()
-    for label, m in (("perfect_foresight", metrics_pf), ("causal", metrics_causal)):
+    for label, m in (
+        ("perfect_foresight", metrics_pf),
+        ("causal", metrics_causal),
+    ):
         accounted_for = m["heat_produced_mwh"] + m["unserved_heat_mwh"]
         gap = abs(accounted_for - true_annual_demand)
         if gap > 1.0:

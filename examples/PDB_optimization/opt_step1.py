@@ -47,12 +47,15 @@ Outputs (directories are created automatically if they do not exist):
     A summary table of all solved cases is also printed to the console.
 """
 
+# TODO:
+# 1. Organize default parameter values in solve_case as literals
+
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import oemof.solph as solph
 import pandas as pd
 import pyomo.environ as po
+from oemof import solph
 
 DATA_DIR = Path("data")
 PLOT_DIR = Path("plots")
@@ -747,9 +750,11 @@ def annotate_case(ax, c, dx=9, dy=-3, ha="left"):
         ha=ha,
         # Backing so the iso-cost line in plot 3 -- which runs through the gas
         # boiler anchor at exactly this height -- does not strike the label out.
-        bbox=dict(
-            boxstyle="square,pad=0.15", facecolor="white", edgecolor="none"
-        ),
+        bbox={
+            "boxstyle": "square,pad=0.15",
+            "facecolor": "white",
+            "edgecolor": "none",
+        },
     )
 
 
@@ -922,14 +927,20 @@ for i, c in enumerate(cluster):
         fontsize=7.5,
         va="center",
         ha="left",
-        arrowprops=dict(
-            arrowstyle="-", color="0.6", linewidth=0.6, shrinkA=0, shrinkB=4
-        ),
+        arrowprops={
+            "arrowstyle": "-",
+            "color": "0.6",
+            "linewidth": 0.6,
+            "shrinkA": 0,
+            "shrinkB": 4,
+        },
         # Opaque backing: the iso-cost line below runs straight through this
         # column and would otherwise strike a label out.
-        bbox=dict(
-            boxstyle="square,pad=0.15", facecolor="white", edgecolor="none"
-        ),
+        bbox={
+            "boxstyle": "square,pad=0.15",
+            "facecolor": "white",
+            "edgecolor": "none",
+        },
     )
 
 annotate_case(ax3, next(c for c in full_sweep if c["co2_price"] == 0))
