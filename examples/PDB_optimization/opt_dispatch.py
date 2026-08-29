@@ -88,6 +88,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import oemof.solph as solph
 import pandas as pd
+import pyomo.environ as po
 from tqdm import tqdm
 
 DATA_DIR = Path("data")
@@ -159,34 +160,38 @@ CO2_PRICE = 20
 # Rolling-horizon settings for the causal case.
 HORIZON = 48  # hours the causal solve "sees" ahead at each re-solve
 CONTROL_STEP = 24  # hours actually implemented before re-solving
-N_KNOWN = 1  # hours of *true* data available at each re-solve (=1: only "now")
+# N_KNOWN MUST equal CONTROL_STEP: every hour that gets implemented (kept
+# as "what actually happened") must be based on data that was genuinely
+# real/known at the time it was committed to, not a persistence forecast.
+# Setting N_KNOWN < CONTROL_STEP would silently record forecast values as
+# if they were the real outcome for the un-implemented-yet-kept hours --
+# this was an actual bug here (N_KNOWN=1, CONTROL_STEP=24) caught by
+# comparing the stitched causal dispatch's total heat_demand against the
+# real annual total: they must always match exactly, and they didn't
+# (58,129 MWh vs the true 66,486 MWh) until this was fixed.
+N_KNOWN = CONTROL_STEP
 
-# Desired storage reserve band for the CAUSAL case only (perfect foresight
-# is left unconstrained -- it's the ideal baseline and doesn't need
-# artificial conservatism, since it already knows exactly when to draw the
-# storage down). The intent is to stop the causal controller from trusting
-# a flat persistence forecast enough to fully drain the storage in a
-# routine period, only to be caught short when an unanticipated sustained
-# demand event (e.g. a multi-day cold snap) hits right afterward.
+# Soft storage reserve target for the CAUSAL case only (perfect foresight is
+# left unconstrained -- it already achieves 0 unserved heat). Intent: stop
+# the causal controller's flat persistence forecast from fully draining the
+# tank on routine days for marginal cost savings, leaving nothing in
+# reserve when an unanticipated multi-day demand event hits.
 #
-# IMPORTANT CAVEAT: this is implemented below as oemof's native
-# `min_storage_level`/`max_storage_level`, which is a HARD bound -- the
-# storage literally cannot discharge below MIN_STORAGE_RESERVE_FRACTION,
-# even during a genuine emergency where using that last reserve is exactly
-# the right call. That means during a real cold snap, the model will show
-# MORE unserved heat than physically necessary (real stored energy sits
-# idle below the floor rather than being used). This is a simple first
-# pass using a well-tested oemof feature; a proper "desired but overridable"
-# target would need a soft penalty (via a custom Pyomo term) instead of a
-# hard bound -- worth doing as a follow-up if this hard version is too
-# conservative during genuine emergencies.
-#
-# These are PROVISIONAL starting values -- see analyze_storage_reserve.py
-# for how to derive better ones from the actual year of data (comparing
-# perfect foresight's own minimum SOC against the worst historical
-# multi-day demand deficit).
-MIN_STORAGE_RESERVE_FRACTION = 0.15  # 15% of capacity
-MAX_STORAGE_RESERVE_FRACTION = 0.95  # 95% of capacity
+# This was tried first as a HARD bound (oemof's native min_storage_level)
+# and measured to make things WORSE (188.7 MWh unserved vs. 183.5 MWh
+# without any floor) -- storage hit exactly the floor during the actual
+# emergency and got stuck there, unable to draw down further even though
+# doing so would have reduced the shortfall. A SOFT target fixes this: it's
+# a cost penalty for dipping below the target (added directly to the Pyomo
+# objective, since oemof has no native soft-storage-level feature), not a
+# hard limit -- the storage is always free to go lower if that's cheaper
+# than the alternative. The penalty must sit well above normal generation
+# costs (~1-30 EUR/MWh here) so the model actually bothers keeping the
+# reserve day-to-day, but far below VOLL_COST_EUR_PER_MWH (10,000) so a
+# genuine emergency always prefers dipping into the reserve over accepting
+# unserved heat.
+SOFT_RESERVE_TARGET_LEVEL = 0.15  # 15% of capacity
+SOFT_RESERVE_PENALTY_EUR_PER_MWH = 50
 
 # Storage initial condition: NOT hard-coded. The combined converter capacity
 # is deliberately smaller than peak heat demand (the design relies on the
@@ -256,7 +261,8 @@ def solve_dispatch_window(
     initial_storage_level,
     balanced,
     min_storage_level=0.0,
-    max_storage_level=1.0,
+    soft_reserve_level=None,
+    soft_reserve_penalty_eur_per_mwh=None,
 ):
     """Solve a fixed-capacity dispatch LP over one window of data.
 
@@ -272,19 +278,28 @@ def solve_dispatch_window(
     ``storage_content.iloc[0]`` is the state at the start of the window and
     ``storage_content.iloc[k]`` is the state after ``k`` intervals.
 
+    ``min_storage_level`` (fraction of ``cap_storage``, default 0.0 = no
+    floor) is passed straight to oemof's GenericStorage as a HARD bound --
+    the storage literally cannot discharge below it, even in a genuine
+    emergency where using that last reserve would reduce unserved heat.
+    Measured to make things WORSE here (see SOFT_RESERVE_TARGET_LEVEL's
+    docstring) -- kept available but not used by default.
+
+    ``soft_reserve_level``/``soft_reserve_penalty_eur_per_mwh`` (both None
+    by default = no soft reserve) add a cost penalty, directly to the
+    Pyomo objective, for the storage dipping below `soft_reserve_level`
+    (a fraction of `cap_storage`) at any timepoint -- NOT a hard bound, so
+    the storage can still go lower than this if that's genuinely cheaper
+    (e.g. avoiding unserved heat during a real emergency). See
+    SOFT_RESERVE_TARGET_LEVEL's docstring for why this replaced the hard
+    `min_storage_level` approach above.
+
     An unlimited "unserved heat" source, penalized at VOLL_COST_EUR_PER_MWH,
     is always connected to the heat network (see that constant's docstring)
     so demand is met subject to a heavy economic penalty rather than being a
     hard constraint that can make the whole window infeasible. The returned
     ``dispatch`` always has an ``unserved_heat`` column; call
     `report_unserved_heat` on the result to see whether/where it was used.
-
-    ``min_storage_level``/``max_storage_level`` are fractions (0-1) of
-    ``cap_storage`` passed straight to oemof's GenericStorage -- a HARD
-    bound the storage content can never cross (see
-    MIN_STORAGE_RESERVE_FRACTION's docstring for the caveat this implies).
-    Defaults (0.0, 1.0) mean the storage's full physical range is usable,
-    which is what the perfect-foresight case should always use.
     """
     # Per-interval cost sequences need N values (one per dispatch interval),
     # matching the N-values-for-N+1-boundaries convention used everywhere
@@ -396,38 +411,62 @@ def solve_dispatch_window(
         "balanced": balanced,
         "loss_rate": STORAGE_LOSS_RATE,
         "min_storage_level": min_storage_level,
-        "max_storage_level": max_storage_level,
     }
     if initial_storage_level is not None:
-        # Clamp defensively: a hard min/max bound would otherwise reject an
-        # initial_storage_level handed in from outside that bound (e.g. a
-        # value carried over before this bound was introduced, or a
-        # slightly-out-of-range value from floating point rounding) with an
-        # opaque infeasibility rather than the real cause.
-        clamped = min(max(initial_storage_level, min_storage_level), max_storage_level)
-        if clamped != initial_storage_level:
+        if initial_storage_level < min_storage_level:
+            # Defensive only -- with the floor enforced above, a window's
+            # own storage_content should never end up below it, so this
+            # should not normally trigger. Clamp rather than let oemof
+            # reject an out-of-range initial level with an opaque error.
             print(
                 f"  (initial_storage_level {initial_storage_level:.4f} "
-                f"clamped to {clamped:.4f} to respect "
-                f"[{min_storage_level}, {max_storage_level}])"
+                f"below min_storage_level {min_storage_level}; clamping)"
             )
-        storage_kwargs["initial_storage_level"] = clamped
+            initial_storage_level = min_storage_level
+        storage_kwargs["initial_storage_level"] = initial_storage_level
     heat_storage = solph.components.GenericStorage(**storage_kwargs)
 
     es.add(gas_boiler, heat_pump, heat_storage)
 
     model = solph.Model(es)
+
+    if soft_reserve_level is not None:
+        # Soft reserve: penalize (don't forbid) storage_content falling
+        # below `soft_reserve_level * cap_storage` at any timepoint. oemof
+        # has no native feature for this, so it's added directly as a
+        # Pyomo Var + Constraint + objective term on top of the built
+        # model. `reserve_deficit[t] >= target - storage_content[t]` with
+        # reserve_deficit >= 0 means the deficit is exactly
+        # max(0, target - storage_content[t]) at the optimum (never more,
+        # since anything above that only adds needless objective cost).
+        storage_content_var = model.GenericStorageBlock.storage_content
+        storage_keys = [
+            k for k in storage_content_var if k[0] is heat_storage
+        ]
+        target_mwh = soft_reserve_level * cap_storage
+
+        model.reserve_deficit = po.Var(storage_keys, within=po.NonNegativeReals)
+
+        def _reserve_rule(m, node, t):
+            return (
+                m.reserve_deficit[node, t]
+                >= target_mwh - storage_content_var[node, t]
+            )
+
+        model.reserve_deficit_constraint = po.Constraint(
+            storage_keys, rule=_reserve_rule
+        )
+        model.objective.expr += (
+            sum(model.reserve_deficit[k] for k in storage_keys)
+            * soft_reserve_penalty_eur_per_mwh
+        )
+
     model.solve(solver="cbc", solve_kwargs={"tee": False})
 
     term_condition = str(
         model.solver_results["Solver"][0]["Termination condition"]
     )
     if term_condition != "optimal":
-        # With the unlimited unserved-heat source above, a demand shortfall
-        # can no longer cause this -- if it still happens, the cause is
-        # something else entirely (a genuine model/data problem, or a
-        # solver/numerical issue), so this is now a much more surprising
-        # failure than it used to be.
         raise RuntimeError(
             f"Dispatch window starting at {window.index[0]} was not solved "
             f"to optimality (termination condition: {term_condition}), "
@@ -648,8 +687,8 @@ def run_causal_dispatch(
             max_heat_demand,
             storage_level,
             balanced=False,
-            min_storage_level=MIN_STORAGE_RESERVE_FRACTION,
-            max_storage_level=MAX_STORAGE_RESERVE_FRACTION,
+            soft_reserve_level=SOFT_RESERVE_TARGET_LEVEL,
+            soft_reserve_penalty_eur_per_mwh=SOFT_RESERVE_PENALTY_EUR_PER_MWH,
         )
 
         implemented_dispatch.append(dispatch.iloc[:this_control_step])
@@ -683,11 +722,63 @@ def run_causal_dispatch(
     return full_dispatch, full_storage
 
 
+def storage_and_reserve_stats(dispatch, storage_content):
+    """Storage state-of-charge extremes and generation-capacity reserve
+    margin -- simple risk indicators for how close a dispatch strategy
+    came to its hard operating limits, independent of cost/CO2/LCOH.
+
+    ``storage_min/max_mwh`` (and the capacity-fraction versions) show how
+    close the storage came to running empty or overflowing full over the
+    simulated year.
+
+    ``min_daily_reserve_mw`` is the smallest margin, on the single worst
+    day of the year, between the fixed converters' combined installed
+    capacity (gas boiler + heat pump) and what was actually dispatched
+    from them that day -- i.e. how little spare *firm* generation
+    headroom was left at the tightest moment. This deliberately excludes
+    the storage's own contribution (that risk is captured separately by
+    the storage min/max above): a small or negative converter reserve
+    means the system was leaning heavily, or entirely, on storage to
+    cover the gap at that moment, which is exactly the situation that
+    produced unserved heat in the causal case once the storage ran out.
+    """
+    storage_min_mwh = float(storage_content.min())
+    storage_max_mwh = float(storage_content.max())
+
+    installed_generation_mw = CAP_GAS_BOILER_MW + CAP_HEAT_PUMP_MW
+    reserve_mw = installed_generation_mw - (
+        dispatch["gas_boiler"] + dispatch["heat_pump"]
+    )
+    daily_min_reserve = reserve_mw.groupby(reserve_mw.index.date).min()
+    worst_day = daily_min_reserve.idxmin()
+
+    return {
+        "storage_min_mwh": storage_min_mwh,
+        "storage_max_mwh": storage_max_mwh,
+        "storage_min_pct_of_capacity": 100 * storage_min_mwh / CAP_STORAGE_MWH,
+        "storage_max_pct_of_capacity": 100 * storage_max_mwh / CAP_STORAGE_MWH,
+        "min_daily_generation_reserve_mw": float(daily_min_reserve.min()),
+        "min_daily_generation_reserve_date": str(worst_day),
+    }
+
+
 def evaluate_dispatch(dispatch, price_data):
     """Compute operation cost, CO2 and LCOH for an (already implemented)
     dispatch time series, evaluated against the *real* (not forecast)
     prices -- i.e. what this dispatch would actually have cost/emitted in
     the real world, however it was decided.
+
+    LCOH here is the cost of energy ACTUALLY delivered by the real
+    hardware (gas boiler + heat pump + storage), excluding both the
+    unserved-heat penalty (VOLL_COST_EUR_PER_MWH) and the unserved MWh
+    themselves from the denominator. Physically, no fuel was burned to
+    produce heat that was never delivered -- a building went cold instead
+    -- so folding a fictional VOLL cost into a €/MWh production-cost
+    figure would conflate "cost of energy delivered" with "cost of failing
+    to deliver," which are different things. The VOLL penalty and the
+    unserved-heat volume are still reported (see
+    `unserved_heat_cost_eur`/`unserved_heat_mwh`) as separate reliability
+    metrics rather than being blended into LCOH.
     """
     gas_price = price_data["gas price"].reindex(dispatch.index)
     el_price = price_data["el_spot_price"].reindex(dispatch.index)
@@ -710,6 +801,9 @@ def evaluate_dispatch(dispatch, price_data):
     unserved_heat_mwh = dispatch["unserved_heat"].sum()
     unserved_heat_cost = VOLL_COST_EUR_PER_MWH * unserved_heat_mwh
 
+    # Real operating cost: fuel, electricity, and storage O&M only. The
+    # unserved-heat penalty is deliberately NOT included here -- it enters
+    # `unserved_heat_cost_eur` separately instead of into LCOH's numerator.
     operation_cost = (
         VAR_COST_GAS_BOILER * dispatch["gas_boiler"]
         + gas_price * gas_consumed
@@ -717,7 +811,7 @@ def evaluate_dispatch(dispatch, price_data):
         + el_price * electricity_consumed
         + VAR_COST_STORAGE * dispatch["storage_charge"]
         + VAR_COST_STORAGE * dispatch["storage_discharge"]
-    ).sum() + unserved_heat_cost
+    ).sum()
 
     total_co2 = (CO2_GAS * gas_consumed + CO2_EL * electricity_consumed).sum()
 
@@ -726,7 +820,13 @@ def evaluate_dispatch(dispatch, price_data):
         + SPEC_INV_HEAT_PUMP * CAP_HEAT_PUMP_MW
         + SPEC_INV_STORAGE * CAP_STORAGE_MWH
     )
-    heat_produced = dispatch["heat_demand"].sum()
+    # Heat ACTUALLY delivered by the real hardware -- total demand minus
+    # whatever the unserved-heat placeholder had to cover. This is the
+    # correct denominator for a cost-of-energy-delivered figure; using
+    # total demand (unchanged by any shortfall, since the model's internal
+    # balance always "meets" it via the placeholder) would understate the
+    # true cost per MWh actually produced.
+    heat_produced = dispatch["heat_demand"].sum() - unserved_heat_mwh
     lcoh = LCOH(invest_cost, operation_cost, heat_produced)
 
     return {
@@ -739,6 +839,16 @@ def evaluate_dispatch(dispatch, price_data):
         "unserved_heat_mwh": unserved_heat_mwh,
         "unserved_heat_hours": int((dispatch["unserved_heat"] > 1e-6).sum()),
         "unserved_heat_cost_eur": unserved_heat_cost,
+        # Optional secondary/blended metric: folds the VOLL penalty back in
+        # and divides by total demand (not just what was actually
+        # delivered) -- a single number for anyone who wants unreliability
+        # priced into a €/MWh figure. NOT the primary metric above, and not
+        # used anywhere else in this script; provided for reference only.
+        "lcoh_including_voll_eur_per_mwh": LCOH(
+            invest_cost,
+            operation_cost + unserved_heat_cost,
+            dispatch["heat_demand"].sum(),
+        ),
     }
 
 
@@ -758,9 +868,6 @@ def plot_dispatch(dispatch, case_label, slug):
         ("storage_discharge", "heat storage (discharge)"),
     ]
     if dispatch["unserved_heat"].max() > 1e-6:
-        # Only add this segment (and its legend entry) when it's actually
-        # nonzero somewhere, so a clean perfect-foresight plot doesn't
-        # carry a legend entry for something that never appears.
         columns.append(("unserved_heat", "unserved heat"))
     for col, label in columns:
         ax.bar(
@@ -832,6 +939,30 @@ if __name__ == "__main__":
 
     metrics_pf = evaluate_dispatch(dispatch_pf, data)
     metrics_causal = evaluate_dispatch(dispatch_causal, data)
+    metrics_pf.update(storage_and_reserve_stats(dispatch_pf, storage_pf))
+    metrics_causal.update(
+        storage_and_reserve_stats(dispatch_causal, storage_causal)
+    )
+
+    # Both cases must always account for exactly the real annual demand,
+    # split between heat actually delivered and unserved heat (since
+    # heat_produced_mwh now deliberately EXCLUDES unserved heat -- see
+    # evaluate_dispatch). If the two don't add up, some hours in the
+    # stitched dispatch are reflecting forecast values rather than what
+    # genuinely happened (see the N_KNOWN == CONTROL_STEP requirement).
+    true_annual_demand = data["heat demand"].iloc[:-1].sum()
+    for label, m in (("perfect_foresight", metrics_pf), ("causal", metrics_causal)):
+        accounted_for = m["heat_produced_mwh"] + m["unserved_heat_mwh"]
+        gap = abs(accounted_for - true_annual_demand)
+        if gap > 1.0:
+            raise RuntimeError(
+                f"[{label}] heat_produced_mwh + unserved_heat_mwh "
+                f"({accounted_for:.1f}) does not match the true annual "
+                f"demand ({true_annual_demand:.1f} MWh, gap {gap:.1f} MWh) "
+                "-- some hours in the stitched dispatch are not reflecting "
+                "real data. Check N_KNOWN == CONTROL_STEP and the window "
+                "stitching logic in run_causal_dispatch."
+            )
 
     dispatch_pf.to_csv(RESULTS_DIR / "dispatch_perfect_foresight.csv")
     dispatch_causal.to_csv(RESULTS_DIR / "dispatch_causal.csv")
