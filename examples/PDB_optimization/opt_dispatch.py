@@ -81,16 +81,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import oemof.solph as solph
 import pandas as pd
-
-try:
-    from tqdm import tqdm
-except ImportError:  # pragma: no cover
-    def tqdm(iterable, **kwargs):
-        print(
-            "(tqdm not installed -- install with `pip install tqdm` for a "
-            "progress bar; continuing without one.)"
-        )
-        return iterable
+from tqdm import tqdm
 
 DATA_DIR = Path("data")
 PLOT_DIR = Path("plots")
@@ -126,7 +117,9 @@ SOLUTIONS = {
     },
 }
 
-SELECTED_SOLUTION = "solution_1"   # change to "solution_2" to evaluate that design instead
+SELECTED_SOLUTION = (
+    "solution_1"  # change to "solution_2" to evaluate that design instead
+)
 
 # Safety margin applied to all three fixed capacities. The exact LP-optimal
 # capacities are only available to 3 decimal places (as printed by the
@@ -144,7 +137,7 @@ SELECTED_SOLUTION = "solution_1"   # change to "solution_2" to evaluate that des
 # For an exact (no-margin) fix instead, export the sizing run's Investment
 # results at full float precision (e.g. to a small JSON/CSV) and load them
 # here directly, rather than hand-copying the printed, rounded figures.
-CAPACITY_SAFETY_MARGIN = 0.002   # 0.2% headroom
+CAPACITY_SAFETY_MARGIN = 0.002  # 0.2% headroom
 
 _design = SOLUTIONS[SELECTED_SOLUTION]
 CAP_GAS_BOILER_MW = _design["cap_gas_boiler_mw"] * (1 + CAPACITY_SAFETY_MARGIN)
@@ -157,9 +150,9 @@ CAP_STORAGE_MWH = _design["cap_storage_mwh"] * (1 + CAPACITY_SAFETY_MARGIN)
 CO2_PRICE = 20
 
 # Rolling-horizon settings for the causal case.
-HORIZON = 48         # hours the causal solve "sees" ahead at each re-solve
-CONTROL_STEP = 24    # hours actually implemented before re-solving
-N_KNOWN = 1          # hours of *true* data available at each re-solve (=1: only "now")
+HORIZON = 48  # hours the causal solve "sees" ahead at each re-solve
+CONTROL_STEP = 24  # hours actually implemented before re-solving
+N_KNOWN = 1  # hours of *true* data available at each re-solve (=1: only "now")
 
 # Storage initial condition: NOT hard-coded. The combined converter capacity
 # is deliberately smaller than peak heat demand (the design relies on the
@@ -187,8 +180,8 @@ SPEC_INV_GAS_BOILER = 60000
 SPEC_INV_HEAT_PUMP = 500000
 SPEC_INV_STORAGE = 1060
 
-CO2_GAS = 0.2   # tCO2/MWh gas
-CO2_EL = 0.15   # tCO2/MWh electricity
+CO2_GAS = 0.2  # tCO2/MWh gas
+CO2_EL = 0.15  # tCO2/MWh electricity
 
 
 def epc(invest_cost, i=0.05, n=20):
@@ -292,9 +285,7 @@ def solve_dispatch_window(
         # the *pattern* of any remaining shortfall can be inspected.
         emergency_source = solph.components.Source(
             label="emergency heat",
-            outputs={
-                heat_bus: solph.flows.Flow(variable_costs=1e6)
-            },
+            outputs={heat_bus: solph.flows.Flow(variable_costs=1e6)},
         )
         es.add(emergency_source)
 
@@ -333,24 +324,24 @@ def solve_dispatch_window(
     # exactly what the capacity-sizing run did -- the optimizer picks
     # whichever start/end SOC makes the whole horizon work best, rather than
     # a value imposed from outside that might not be feasible.
-    storage_kwargs = dict(
-        label="heat storage",
-        nominal_capacity=cap_storage,
-        inputs={
+    storage_kwargs = {
+        "label": "heat storage",
+        "nominal_capacity": cap_storage,
+        "inputs": {
             heat_bus: solph.flows.Flow(
                 variable_costs=VAR_COST_STORAGE,
                 nominal_capacity=cap_storage / 24,
             )
         },
-        outputs={
+        "outputs": {
             heat_bus: solph.flows.Flow(
                 variable_costs=VAR_COST_STORAGE,
                 nominal_capacity=cap_storage / 24,
             )
         },
-        balanced=balanced,
-        loss_rate=STORAGE_LOSS_RATE,
-    )
+        "balanced": balanced,
+        "loss_rate": STORAGE_LOSS_RATE,
+    }
     if initial_storage_level is not None:
         storage_kwargs["initial_storage_level"] = initial_storage_level
     heat_storage = solph.components.GenericStorage(**storage_kwargs)
@@ -481,7 +472,7 @@ def make_persistence_forecast(data, t0, horizon, n_known=1):
         last_known_row = data.iloc[t0 + n_known - 1]
         forecast_rows = pd.DataFrame(
             [last_known_row.to_dict()] * n_forecast,
-            index=idx[len(known):],
+            index=idx[len(known) :],
         )
         window = pd.concat([known, forecast_rows])
     else:
@@ -490,7 +481,16 @@ def make_persistence_forecast(data, t0, horizon, n_known=1):
     return window
 
 
-def diagnose_infeasibility(window, cap_gas_boiler, cap_heat_pump, cap_storage, co2_price, max_heat_demand, initial_storage_level, balanced):
+def diagnose_infeasibility(
+    window,
+    cap_gas_boiler,
+    cap_heat_pump,
+    cap_storage,
+    co2_price,
+    max_heat_demand,
+    initial_storage_level,
+    balanced,
+):
     """Re-solve a window with an unlimited penalized 'emergency heat' source
     so the LP always solves, then report which hours needed it -- i.e. the
     actual location(s) of an otherwise-opaque CBC infeasibility.
@@ -530,10 +530,19 @@ def diagnose_infeasibility(window, cap_gas_boiler, cap_heat_pump, cap_storage, c
     )
     context_lo = max(0, first_pos - 3)
     context_hi = min(len(dispatch), first_pos + 4)
-    print(f"Dispatch around that time step (rows {context_lo}..{context_hi - 1}):")
+    print(
+        f"Dispatch around that time step (rows {context_lo}..{context_hi - 1}):"
+    )
     print(
         dispatch.iloc[context_lo:context_hi][
-            ["gas_boiler", "heat_pump", "storage_discharge", "storage_charge", "heat_demand", "emergency_shortfall"]
+            [
+                "gas_boiler",
+                "heat_pump",
+                "storage_discharge",
+                "storage_charge",
+                "heat_demand",
+                "emergency_shortfall",
+            ]
         ].to_string()
     )
     return dispatch
@@ -562,7 +571,9 @@ def run_perfect_foresight(data, max_heat_demand):
             balanced=True,
         )
     except RuntimeError:
-        print("Infeasible -- re-solving with an emergency heat source to locate the shortfall...")
+        print(
+            "Infeasible -- re-solving with an emergency heat source to locate the shortfall..."
+        )
         diagnose_infeasibility(
             data,
             CAP_GAS_BOILER_MW,
@@ -622,7 +633,9 @@ def run_causal_dispatch(
                 f"was {storage_level:.4f} = "
                 f"{storage_level * CAP_STORAGE_MWH:.2f} MWh)."
             )
-            print("Re-solving this window with an emergency heat source to locate the shortfall...")
+            print(
+                "Re-solving this window with an emergency heat source to locate the shortfall..."
+            )
             diagnose_infeasibility(
                 window,
                 CAP_GAS_BOILER_MW,
@@ -640,7 +653,9 @@ def run_causal_dispatch(
         # hand-off, already recorded); keep it only for the very first
         # window so the stitched series isn't full of duplicate boundaries.
         if n_windows == 0:
-            implemented_storage.append(storage_content.iloc[: this_control_step + 1])
+            implemented_storage.append(
+                storage_content.iloc[: this_control_step + 1]
+            )
         else:
             implemented_storage.append(
                 storage_content.iloc[1 : this_control_step + 1]
