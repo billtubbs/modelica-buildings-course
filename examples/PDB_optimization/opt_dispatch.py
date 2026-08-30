@@ -77,14 +77,16 @@ Input:
         * "el_spot_price" electricity spot price [EUR/MWh]
     (Any additional columns, e.g. an emission-factor column, are ignored.)
 
-Outputs:
-    ``<PLOT_DIR>/dispatch_comparison_<case>.png``
-    ``<PLOT_DIR>/storage_soc_comparison.png``
-        Dispatch stacks for each case and an overlaid storage
-        state-of-charge comparison.
+Outputs (computation only -- see opt_dispatch_plot.py for plots, which
+reads these CSVs directly rather than re-solving anything):
     ``<RESULTS_DIR>/dispatch_perfect_foresight.csv``
     ``<RESULTS_DIR>/dispatch_causal.csv``
         Hourly dispatch time series for each case.
+    ``<RESULTS_DIR>/storage_perfect_foresight.csv``
+    ``<RESULTS_DIR>/storage_causal.csv``
+        Boundary-indexed storage-content (state of charge) series for each
+        case (see solve_dispatch_window's docstring for the boundary vs.
+        interval indexing distinction).
     ``<RESULTS_DIR>/comparison_summary.csv``
         One-row-per-case summary of cost, CO2 and LCOH.
 
@@ -113,7 +115,6 @@ Outputs:
 
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pyomo.environ as po
@@ -121,10 +122,9 @@ from oemof import solph
 from tqdm import tqdm
 
 DATA_DIR = Path("data")
-PLOT_DIR = Path("plots")
 RESULTS_DIR = Path("results")
 
-for directory in (DATA_DIR, PLOT_DIR, RESULTS_DIR):
+for directory in (DATA_DIR, RESULTS_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
@@ -1028,69 +1028,6 @@ def evaluate_dispatch(dispatch, price_data):
     }
 
 
-def plot_dispatch(dispatch, case_label, slug):
-    unit_colors = {
-        "heat pump": "#B54036",
-        "gas boiler": "#EC6707",
-        "heat storage (discharge)": "#BFBFBF",
-        "heat storage (charge)": "#696969",
-        "unserved heat": "#D7263D",
-    }
-    fig, ax = plt.subplots(figsize=[10, 6])
-    bottom = 0
-    columns = [
-        ("heat_pump", "heat pump"),
-        ("gas_boiler", "gas boiler"),
-        ("storage_discharge", "heat storage (discharge)"),
-    ]
-    if dispatch["unserved_heat"].max() > 1e-6:
-        columns.append(("unserved_heat", "unserved heat"))
-    for col, label in columns:
-        ax.bar(
-            dispatch.index,
-            dispatch[col],
-            label=label,
-            color=unit_colors[label],
-            bottom=bottom,
-        )
-        bottom = bottom + dispatch[col]
-    ax.bar(
-        dispatch.index,
-        -dispatch["storage_charge"],
-        label="heat storage (charge)",
-        color=unit_colors["heat storage (charge)"],
-    )
-    ax.legend(loc="upper center", ncol=2)
-    ax.grid(axis="y")
-    ax.set_ylabel("Hourly heat production in MWh")
-    ax.set_title(f"Dispatch -- {case_label}")
-    fig.tight_layout()
-    fig.savefig(PLOT_DIR / f"dispatch_comparison_{slug}.png", dpi=150)
-
-
-def plot_storage_comparison(storage_pf, storage_causal):
-    fig, ax = plt.subplots(figsize=[10, 6])
-    ax.plot(
-        storage_pf.index,
-        storage_pf.to_numpy(),
-        label="perfect foresight",
-        color="#00395B",
-    )
-    ax.plot(
-        storage_causal.index,
-        storage_causal.to_numpy(),
-        label="causal (persistence forecast)",
-        color="#EC6707",
-        alpha=0.8,
-    )
-    ax.legend()
-    ax.grid(axis="y")
-    ax.set_ylabel("Storage content [MWh]")
-    ax.set_title("Storage state of charge: perfect foresight vs. causal")
-    fig.tight_layout()
-    fig.savefig(PLOT_DIR / "storage_soc_comparison.png", dpi=150)
-
-
 if __name__ == "__main__":
     print(
         f"Evaluating dispatch for '{SELECTED_SOLUTION}' "
@@ -1145,10 +1082,16 @@ if __name__ == "__main__":
 
     dispatch_pf.to_csv(RESULTS_DIR / "dispatch_perfect_foresight.csv")
     dispatch_causal.to_csv(RESULTS_DIR / "dispatch_causal.csv")
-
-    plot_dispatch(dispatch_pf, "perfect foresight", "perfect_foresight")
-    plot_dispatch(dispatch_causal, "causal (persistence forecast)", "causal")
-    plot_storage_comparison(storage_pf, storage_causal)
+    # Storage content is boundary-indexed (N+1 points per case, see
+    # solve_dispatch_window's docstring) -- saved separately from the
+    # interval-indexed dispatch flows above so the plot script never needs
+    # to re-solve anything to get the SOC trajectory.
+    storage_pf.rename("storage_content_mwh").to_csv(
+        RESULTS_DIR / "storage_perfect_foresight.csv"
+    )
+    storage_causal.rename("storage_content_mwh").to_csv(
+        RESULTS_DIR / "storage_causal.csv"
+    )
 
     summary = pd.DataFrame(
         {"perfect_foresight": metrics_pf, "causal": metrics_causal}
@@ -1164,5 +1107,3 @@ if __name__ == "__main__":
 
     print("\nComparison summary:")
     print(summary.round(3).to_string())
-
-    plt.show()

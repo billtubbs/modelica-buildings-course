@@ -29,17 +29,18 @@ Input:
         * "gas price"     gas commodity price [EUR/MWh]
         * "el_spot_price" electricity spot price [EUR/MWh]
 
-Outputs (directories are created automatically if they do not exist):
-    ``<PLOT_DIR>/pareto_1_anchors.png``
-    ``<PLOT_DIR>/pareto_2_hp_storage.png``
-    ``<PLOT_DIR>/pareto_3_full.png``
-        Cost vs. CO2 Pareto-front scatter plots, each building on the last.
-    ``<PLOT_DIR>/dispatch_<case>.png``, ``<PLOT_DIR>/storage_content_<case>.png``
-        Hourly dispatch stack and storage state-of-charge plots, generated
-        for the cheapest full-system design and for the lambda = 20 design.
+Outputs (computation only -- see opt_step1_plot.py for plots, which reads
+these CSVs directly rather than re-solving anything; directories are
+created automatically if they do not exist):
+    ``<RESULTS_DIR>/cases_summary.csv``
+        One row per solved case (all 9: both anchors, the HP+storage
+        optimum, and the 6-point lambda sweep) with capacities, LCOH, CO2,
+        and annual dispatch totals -- everything the Pareto plots need.
     ``<RESULTS_DIR>/dispatch_<case>.csv``
-        Hourly dispatch time series (per technology, plus gas price and
-        energy balance check) for the same two cases.
+        Hourly dispatch time series (per technology, plus gas price,
+        electricity price, storage content, and an energy balance check)
+        for the two cases plotted in detail: the cheapest full-system
+        design and the lambda = 20 design.
     ``<RESULTS_DIR>/dispatch_combitimetable_<case>.txt``
         Modelica ``CombiTimeTable`` export of the lambda = 20 dispatch, in
         watts, for use as a boundary condition in a downstream Modelica model.
@@ -52,16 +53,14 @@ Outputs (directories are created automatically if they do not exist):
 
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import pandas as pd
 import pyomo.environ as po
 from oemof import solph
 
 DATA_DIR = Path("data")
-PLOT_DIR = Path("plots")
 RESULTS_DIR = Path("results")
 
-for directory in (DATA_DIR, PLOT_DIR, RESULTS_DIR):
+for directory in (DATA_DIR, RESULTS_DIR):
     directory.mkdir(parents=True, exist_ok=True)
 
 
@@ -427,6 +426,7 @@ def solve_case(
         "_data_heat_bus": data_heat_bus,
         "_data_heat_storage": data_heat_storage,
         "_gas_price": data["gas price"],
+        "_el_price": data["el_spot_price"],
     }
 
 
@@ -439,83 +439,79 @@ def slugify(label):
     )
 
 
-def plot_dispatch(res):
-    unit_colors = {
-        "gas boiler": "#EC6707",
-        "heat pump": "#B54036",
-        "heat storage (discharge)": "#BFBFBF",
-        "heat storage (charge)": "#696969",
-    }
+def save_case_results(res):
+    """Save a detailed hourly dispatch CSV for one case -- computation
+    only, no plotting (see opt_step1_plot.py for that).
 
+    oemof's flow sequences here come back at N+1 length (one per time
+    POINT/boundary, matching `data_heat_storage`'s own convention) rather
+    than N (one per interval), with a trailing NaN for the flow columns at
+    the final boundary -- confirmed by directly inspecting the raw output.
+    Truncated defensively to the first N values (matching the demand
+    `fix` profile's own N-interval convention) rather than carrying that
+    NaN tail into the saved CSV.
+
+    ``storage_content`` is saved as the END-OF-HOUR level (i.e. the
+    boundary-indexed series shifted by one position), consistent with how
+    it's later used for the monthly-profile plot: row t's other columns
+    are what happened DURING hour t, and storage_content is the level AT
+    THE END of hour t.
+    """
     data_heat_bus = res["_data_heat_bus"]
     data_heat_storage = res["_data_heat_storage"]
+    n = len(data_heat_bus) - 1
 
-    fig_dispatch, ax = plt.subplots(figsize=[10, 6])
-    bottom = 0
-    for unit in ["heat pump", "gas boiler", "heat storage"]:
-        unit_label = f"{unit} (discharge)" if "storage" in unit else unit
-        ax.bar(
-            data_heat_bus.index,
-            data_heat_bus[((unit, "heat network"), "flow")],
-            label=unit_label,
-            color=unit_colors[unit_label],
-            bottom=bottom,
-        )
-        bottom += data_heat_bus[((unit, "heat network"), "flow")]
-
-    ax.bar(
-        data_heat_bus.index,
-        -1 * data_heat_bus[(("heat network", "heat storage"), "flow")],
-        label="heat storage (charge)",
-        color=unit_colors["heat storage (charge)"],
-    )
-
-    ax.legend(loc="upper center", ncol=2)
-    ax.grid(axis="y")
-    ax.set_ylim(-22, 22)
-    ax.set_ylabel("Hourly heat production in MWh")
-
-    fig_storage, ax = plt.subplots(figsize=[10, 6])
-    ax.plot(
-        data_heat_storage[(("heat storage", "None"), "storage_content")],
-        color="#00395B",
-    )
-    ax.grid(axis="y")
-    ax.set_ylabel("Hourly heat storage content in MWh")
-
-    slug = slugify(res["case_label"])
-    fig_dispatch.tight_layout()
-    fig_storage.tight_layout()
-    fig_dispatch.savefig(PLOT_DIR / f"dispatch_{slug}.png", dpi=150)
-    fig_storage.savefig(PLOT_DIR / f"storage_content_{slug}.png", dpi=150)
+    def _flow(df, key):
+        return df[key].to_numpy()[:n]
 
     dispatch_df = pd.DataFrame(
         {
-            "gas_boiler": data_heat_bus[
-                (("gas boiler", "heat network"), "flow")
-            ],
-            "heat_pump": data_heat_bus[
-                (("heat pump", "heat network"), "flow")
-            ],
-            "storage_discharge": data_heat_bus[
-                (("heat storage", "heat network"), "flow")
-            ],
-            "storage_charge": data_heat_bus[
-                (("heat network", "heat storage"), "flow")
-            ],
-            "heat_demand": data_heat_bus[
-                (("heat network", "heat sink"), "flow")
-            ],
-            "gas_price": res["_gas_price"],
-        }
+            "gas_boiler": _flow(
+                data_heat_bus, (("gas boiler", "heat network"), "flow")
+            ),
+            "heat_pump": _flow(
+                data_heat_bus, (("heat pump", "heat network"), "flow")
+            ),
+            "storage_discharge": _flow(
+                data_heat_bus, (("heat storage", "heat network"), "flow")
+            ),
+            "storage_charge": _flow(
+                data_heat_bus, (("heat network", "heat storage"), "flow")
+            ),
+            "heat_demand": _flow(
+                data_heat_bus, (("heat network", "heat sink"), "flow")
+            ),
+            "gas_price": res["_gas_price"].to_numpy()[:n],
+            "el_spot_price": res["_el_price"].to_numpy()[:n],
+        },
+        index=data_heat_bus.index[:n],
     )
-    dispatch_df["balance"] = (
+
+    storage_content_raw = data_heat_storage[
+        (("heat storage", "None"), "storage_content")
+    ].to_numpy()
+    # End-of-hour level: boundary index k+1 is the state after hour k.
+    dispatch_df["storage_content"] = storage_content_raw[1 : n + 1]
+
+    balance = (
         dispatch_df["gas_boiler"]
         + dispatch_df["heat_pump"]
         + dispatch_df["storage_discharge"]
         - dispatch_df["storage_charge"]
         - dispatch_df["heat_demand"]
     )
+    max_imbalance = balance.abs().max()
+    if max_imbalance > 1e-3:
+        raise RuntimeError(
+            f"Heat balance check failed for case '{res['case_label']}' "
+            f"(max imbalance {max_imbalance:.4f} MW) -- the flow-sequence "
+            "truncation assumption in save_case_results is likely "
+            "misaligned for this oemof version; inspect data_heat_bus "
+            "directly rather than trusting this CSV."
+        )
+    dispatch_df["balance"] = balance
+
+    slug = slugify(res["case_label"])
     dispatch_df.to_csv(RESULTS_DIR / f"dispatch_{slug}.csv")
 
 
@@ -661,7 +657,7 @@ print(
     f"\nPlotting dispatch for the most economic full-system case: "
     f"{best_full['case_label']} (LCOH {best_full['lcoh']:.2f} €/MWh)"
 )
-plot_dispatch(best_full)
+save_case_results(best_full)
 
 # The lambda = 20 design (heat pump 10.6 MW / storage 187 MWh / gas boiler
 # 4.4 MW) is the one handed over to the Modelica model, so it gets its own
@@ -671,304 +667,32 @@ print(
     f"\nPlotting dispatch and writing Modelica table for: "
     f"{case_l20['case_label']} (LCOH {case_l20['lcoh']:.2f} €/MWh)"
 )
-plot_dispatch(case_l20)
+save_case_results(case_l20)
 write_combitimetable(case_l20)
 
 
 # -------------------------------------------------------------------------
-# Plot helpers
+# Save every solved case's scalar fields for the plot script (see
+# opt_step1_plot.py) -- it reads this CSV rather than re-solving anything.
 # -------------------------------------------------------------------------
-# Plots 1 and 2 scale to the solved cases, as they originally did: derived from
-# every case, so points do not shift between those figures as cases are added.
 _all_cases = [boiler_only, hp_only, hp_storage_opt] + full_sweep
-_co2 = [c["co2"] for c in _all_cases]
-_lcoh = [c["lcoh"] for c in _all_cases]
-
-XLIM = (
-    min(_co2) - 0.06 * (max(_co2) - min(_co2)),
-    max(_co2) + 0.06 * (max(_co2) - min(_co2)),
-)
-# Extra headroom below so the lowest-cost points sit clear of the axis.
-YLIM = (
-    min(_lcoh) - 0.18 * (max(_lcoh) - min(_lcoh)),
-    max(_lcoh) + 0.12 * (max(_lcoh) - min(_lcoh)),
-)
-
-# Plot 3 instead uses limits fixed identically in step2c_adv_super.py, _el.py
-# and _eff.py, so that one figure can be read straight across the scenarios.
-# Wide enough to hold every case of all three: CO2 runs from 2216 t (heat pump
-# only at COP 4.5) to 12632 t (gas boiler only, identical in every scenario),
-# LCOH from 15.6 EUR/MWh (the cost optimum on gas reduced 20%) to 24.5 (heat
-# pump only at COP 3.5). The plot-3 label positions below are tuned to this
-# range.
-XLIM3 = (1500, 13500)
-YLIM3 = (14, 26)
-
-
-def style_pareto(ax, xlim=XLIM, ylim=YLIM):
-    ax.set_xlabel("Total CO2 [tCO2]")
-    ax.set_ylabel("LCOH [€/MWh]")
-    ax.grid(True)
-    ax.set_xlim(*xlim)
-    ax.set_ylim(*ylim)
-    # Fixed corner rather than "best", so the legend does not jump between figures.
-    ax.legend(loc="upper right", fontsize=9)
-    # Bottom-left: with the shared limits the bottom-right corner is occupied by
-    # the gas-boiler-only anchor in the half-price-gas scenario.
-    ax.text(
-        0.01,
-        0.02,
-        SIZE_NOTE,
-        transform=ax.transAxes,
-        fontsize=7.5,
-        style="italic",
-        color="0.35",
-        va="bottom",
-        ha="left",
-    )
-
-
-# Compact "heat pump / storage / gas boiler" sizing label. The triple is terse
-# enough to sit next to tightly clustered points; SIZE_NOTE spells out the units.
-SIZE_NOTE = "labels: heat pump [MW] / storage [MWh] / gas boiler [MW]"
-
-
-def size_label(c):
-    return (
-        f"{c['cap_heat_pump_mw']:.1f} / {c['cap_storage_mwh']:.0f}"
-        f" / {c['cap_gas_boiler_mw']:.1f}"
-    )
-
-
-def annotate_case(ax, c, dx=9, dy=-3, ha="left"):
-    ax.annotate(
-        size_label(c),
-        (c["co2"], c["lcoh"]),
-        textcoords="offset points",
-        xytext=(dx, dy),
-        fontsize=7.5,
-        ha=ha,
-        # Backing so the iso-cost line in plot 3 -- which runs through the gas
-        # boiler anchor at exactly this height -- does not strike the label out.
-        bbox={
-            "boxstyle": "square,pad=0.15",
-            "facecolor": "white",
-            "edgecolor": "none",
-        },
-    )
-
-
-def plot_anchors(ax, annotate=False):
-    ax.scatter(
-        boiler_only["co2"],
-        boiler_only["lcoh"],
-        label="gas boiler only",
-        marker="s",
-        s=130,
-        color="#EC6707",
-        zorder=4,
-    )
-    ax.scatter(
-        hp_only["co2"],
-        hp_only["lcoh"],
-        label="heat pump only",
-        marker="^",
-        s=130,
-        color="#B54036",
-        zorder=4,
-    )
-    if annotate:
-        # The boiler anchor sits at the right edge, so its label goes to the left.
-        annotate_case(ax, boiler_only, dx=-11, ha="right")
-        annotate_case(ax, hp_only)
-
-
-def plot_hp_storage_opt(ax, annotate=True, hollow=False):
-    """Plot the single cost-optimal heat pump + storage design.
-
-    ``hollow`` draws it as a ring: in plot 3 the lambda=400 full-system point is
-    nearly coincident with this one (the boiler has all but vanished by then),
-    so a filled marker would hide it.
-    """
-    fill = "none" if hollow else "#00395B"
-    ax.scatter(
-        hp_storage_opt["co2"],
-        hp_storage_opt["lcoh"],
-        label="heat pump + storage (single-objective)",
-        marker="o",
-        s=110,
-        facecolors=fill,
-        edgecolors="#00395B",
-        linewidths=1.8,
-        zorder=4,
-    )
-    if annotate:
-        annotate_case(ax, hp_storage_opt, dx=11)
-
-
-def pareto_front(cases):
-    """Non-dominated cases (minimising both CO2 and LCOH), ordered by CO2.
-
-    Fed every solved design, not just the multi-objective sweep, so the line
-    only ever passes through points nothing else beats on both axes -- the
-    single-technology anchors drop out on their own.
-    """
-    front = [
-        c
-        for c in cases
-        if not any(
-            o["co2"] <= c["co2"]
-            and o["lcoh"] <= c["lcoh"]
-            and (o["co2"] < c["co2"] or o["lcoh"] < c["lcoh"])
-            for o in cases
-        )
-    ]
-    return sorted(front, key=lambda c: c["co2"])
-
-
-def plot_pareto_line(ax, cases, extend_right=False):
-    front = pareto_front(cases)
-    xs = [c["co2"] for c in front]
-    ys = [c["lcoh"] for c in front]
-    if extend_right:
-        # Past the cheapest design, spending more CO2 buys nothing: no design
-        # anywhere to the right costs less. Running the front flat to the edge
-        # makes that explicit, and any point above the flat stretch -- gas
-        # boiler only, in plot 3 -- is visibly off the optimal set.
-        xs.append(XLIM3[1])
-        ys.append(ys[-1])
-    ax.plot(
-        xs,
-        ys,
-        color="black",
-        linestyle="--",
-        linewidth=1.3,
-        zorder=2,
-        label="Pareto front",
-    )
-    return front
-
-
-def plot_sweep(
-    ax, cases, label, marker, color, annotate=lambda c: f"{c['co2_price']:.0f}"
-):
-    ax.scatter(
-        [c["co2"] for c in cases],
-        [c["lcoh"] for c in cases],
-        label=label,
-        marker=marker,
-        s=70,
-        color=color,
-        zorder=3,
-    )
-    if annotate is None:  # caller places the labels itself
-        return
-    for c in cases:
-        ax.annotate(
-            annotate(c),
-            (c["co2"], c["lcoh"]),
-            textcoords="offset points",
-            xytext=(6, 4),
-            fontsize=7,
-        )
-
-
-# -------------------------------------------------------------------------
-# Plot 1: reference anchors only
-# -------------------------------------------------------------------------
-fig1, ax1 = plt.subplots(figsize=(9, 6))
-plot_anchors(ax1, annotate=True)
-style_pareto(ax1)
-fig1.tight_layout()
-
-# -------------------------------------------------------------------------
-# Plot 2: anchors + heat pump + storage optimization search (6 lambda)
-# -------------------------------------------------------------------------
-fig2, ax2 = plt.subplots(figsize=(9, 6))
-plot_anchors(ax2, annotate=True)
-plot_hp_storage_opt(ax2)
-style_pareto(ax2)
-fig2.tight_layout()
-
-# -------------------------------------------------------------------------
-# Plot 3: anchors + HP+storage + full system optimization search (6 lambda)
-# -------------------------------------------------------------------------
-fig3, ax3 = plt.subplots(figsize=(9, 6))
-plot_anchors(ax3, annotate=True)
-plot_hp_storage_opt(ax3, annotate=False, hollow=True)
-plot_sweep(
-    ax3,
-    full_sweep,
-    "heat pump + storage + gas boiler (multi-objective)",
-    "D",
-    "#7A9A01",
-    annotate=None,
-)
-front = plot_pareto_line(
-    ax3,
-    [boiler_only, hp_only, hp_storage_opt] + list(full_sweep),
-    extend_right=True,
-)
-
-# Every marker gets a sizing label. The high-lambda designs and the
-# single-objective ring are packed into a few hundred tCO2, far too close for
-# inline labels, so those go into an aligned column with leader lines. The
-# lambda=0 point stands well clear of the rest and is labelled in place.
-cluster = sorted(
-    [hp_storage_opt] + [c for c in full_sweep if c["co2_price"] > 0],
-    key=lambda c: -c["lcoh"],
-)
-for i, c in enumerate(cluster):
-    ax3.annotate(
-        size_label(c),
-        (c["co2"], c["lcoh"]),
-        xytext=(4600, 20.2 - 0.5 * i),
-        textcoords="data",
-        fontsize=7.5,
-        va="center",
-        ha="left",
-        arrowprops={
-            "arrowstyle": "-",
-            "color": "0.6",
-            "linewidth": 0.6,
-            "shrinkA": 0,
-            "shrinkB": 4,
-        },
-        # Opaque backing: the iso-cost line below runs straight through this
-        # column and would otherwise strike a label out.
-        bbox={
-            "boxstyle": "square,pad=0.15",
-            "facecolor": "white",
-            "edgecolor": "none",
-        },
-    )
-
-annotate_case(ax3, next(c for c in full_sweep if c["co2_price"] == 0))
-
-style_pareto(ax3, XLIM3, YLIM3)
-fig3.tight_layout()
-
-# -------------------------------------------------------------------------
-# Summary table over every solved case
-# -------------------------------------------------------------------------
-for fig, name in (
-    (fig1, "pareto_1_anchors"),
-    (fig2, "pareto_2_hp_storage"),
-    (fig3, "pareto_3_full"),
-):
-    fig.savefig(PLOT_DIR / f"{name}.png", dpi=150)
-
-df = pd.DataFrame([boiler_only, hp_only, hp_storage_opt] + full_sweep)
 summary_cols = [
     "case_label",
     "co2_price",
     "cap_gas_boiler_mw",
     "cap_heat_pump_mw",
     "cap_storage_mwh",
+    "cap_storage_out_mw",
     "lcoh",
     "co2",
+    "e_gas_boiler_mwh",
+    "e_heat_pump_mwh",
+    "e_storage_in_mwh",
+    "e_storage_out_mwh",
+    "e_heat_demand_mwh",
 ]
-print("\nSummary:")
-print(df[summary_cols].round(3).to_string(index=False))
+df = pd.DataFrame(_all_cases)[summary_cols]
+df.to_csv(RESULTS_DIR / "cases_summary.csv", index=False)
 
-plt.show()
+print("\nSummary:")
+print(df.round(3).to_string(index=False))
