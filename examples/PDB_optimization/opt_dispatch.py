@@ -242,10 +242,29 @@ N_KNOWN = CONTROL_STEP
 # stuck exactly at the floor during the real emergency, unable to draw
 # down further even though doing so would have helped.
 #
-# BELIEF_HORIZON_EXTRA_HOURS: how much further past the actual optimization
-# horizon (HORIZON) the observed pattern is extended, PURELY to compute
-# the terminal target -- these extra hours are never part of the LP's own
-# decision variables, only of the target calculation.
+# TARGET POSITION: the end of CONTROL_STEP (what actually gets implemented
+# before the next re-solve), NOT the end of the full lookahead HORIZON.
+# This was chosen over the textbook MPC convention (terminal cost at the
+# full optimization horizon's end) for a conceptual reason, not just an
+# empirical one: everything beyond CONTROL_STEP is a tiled repeating-
+# pattern forecast, not real information -- it's only as good as the
+# assumption that recent conditions persist, and gets progressively more
+# speculative further out. Anchoring the terminal cost to a boundary that
+# sits inside that speculative zone means conserving storage against a
+# forecast that isn't actually trusted that far ahead. CONTROL_STEP is the
+# natural boundary instead: it's exactly "how much do I need in reserve
+# before I next get genuinely new information," which is what a terminal
+# cost is supposed to protect against running out of.
+#
+# This also happens to measure better: 129.2 MWh unserved (CONTROL_STEP)
+# vs. 140.9 MWh (HORIZON) vs. 183.5 MWh (no reserve at all). Both
+# positions were implemented and tested -- if HORIZON is changed to equal
+# CONTROL_STEP, the distinction disappears (both positions coincide).
+#
+# BELIEF_HORIZON_EXTRA_HOURS: how much further past the target position
+# the observed pattern is extended, PURELY to compute the terminal target
+# -- these extra hours are never part of the LP's own decision variables,
+# only of the target calculation.
 BELIEF_HORIZON_EXTRA_HOURS = 24
 SOFT_RESERVE_PENALTY_EUR_PER_MWH = 50
 
@@ -622,20 +641,41 @@ def solve_dispatch_window(
     return dispatch, storage_content
 
 
-def make_persistence_forecast(data, t0, horizon, n_known=1):
+FORECAST_PATTERN_HOURS = 24  # length of the repeating tile pattern used for
+# the actual dispatch forecast -- deliberately DECOUPLED from
+# n_known/CONTROL_STEP (see make_persistence_forecast's docstring for why).
+
+
+def make_persistence_forecast(data, t0, horizon, n_known, pattern_hours=FORECAST_PATTERN_HOURS):
     """Build a forecast window: real data for the first ``n_known`` steps,
-    then a REPEATING-PROFILE forecast for the remaining steps -- the
-    pattern of the ``n_known`` most-recently-known hours (ideally a full
-    day, i.e. n_known=24) is tiled forward to fill the rest of the
+    then a REPEATING-PROFILE forecast for the remaining steps -- a
+    pattern of the most recent REAL ``pattern_hours`` of history (ending
+    at ``t0 + n_known``) is tiled forward to fill the rest of the
     horizon, rather than holding flat at a single value.
 
-    This still only ever uses real, already-observed data (stays fully
-    causal), but is a materially better assumption than flat persistence:
-    a flat forecast anchored to a single hour is blind to the diurnal
-    demand cycle -- e.g. if `n_known` ends at midnight (a naturally low
-    hour), a flat forecast badly underestimates the day's actual peak a
-    few hours later. Tiling the whole observed pattern forward carries
-    that shape (including its peak) into the forecast instead.
+    ``pattern_hours`` is DELIBERATELY DECOUPLED from ``n_known`` (which in
+    turn must equal CONTROL_STEP -- see that constant's docstring): the
+    tile pattern should stay a fixed ~24h (a full day) to capture the
+    diurnal demand cycle regardless of how often the causal case
+    re-solves. Tying the tile length to n_known instead (as an earlier
+    version did) would mean shortening CONTROL_STEP to re-solve more
+    often -- e.g. testing an hourly re-solve for a more realistic
+    real-time operator -- silently shrinks the tile to match, degenerating
+    the forecast back toward flat persistence and losing the daily shape
+    it's meant to capture.
+
+    When ``n_known < pattern_hours``, the pattern reaches back into
+    history from BEFORE ``t0`` -- this is still fully causal (that
+    history is genuinely already-observed, real data from earlier
+    re-solves), never the real future.
+
+    This still only ever uses real, already-observed data, but is a
+    materially better assumption than flat persistence: a flat forecast
+    anchored to a single hour is blind to the diurnal demand cycle -- e.g.
+    if `n_known` ends at midnight (a naturally low hour), a flat forecast
+    badly underestimates the day's actual peak a few hours later. Tiling
+    the whole observed pattern forward carries that shape (including its
+    peak) into the forecast instead.
 
     Returns a DataFrame with ``horizon + 1`` rows (boundaries for
     ``horizon`` dispatch intervals), indexed with the *real* timestamps
@@ -647,7 +687,8 @@ def make_persistence_forecast(data, t0, horizon, n_known=1):
     known = data.iloc[t0 : t0 + n_known].copy()
     n_forecast = len(idx) - len(known)
     if n_forecast > 0:
-        pattern = known.reset_index(drop=True)
+        pattern_start = max(0, t0 + n_known - pattern_hours)
+        pattern = data.iloc[pattern_start : t0 + n_known].reset_index(drop=True)
         n_pattern = len(pattern)
         tiled_rows = [
             pattern.iloc[i % n_pattern] for i in range(n_forecast)
@@ -694,57 +735,76 @@ def minimum_required_storage(
 
 
 def terminal_reserve_target_mwh(
-    data, t0, control_step, belief_extra_hours, cap_gas_boiler, cap_heat_pump, cap_storage
+    data, t0, n_known, target_position, belief_extra_hours,
+    cap_gas_boiler, cap_heat_pump, cap_storage,
 ):
     """Causal terminal reserve target (MWh) for a re-solve starting at
-    `t0`, for the boundary at `control_step` hours from now (i.e. the end
-    of what will actually be IMPLEMENTED before the next re-solve -- not
-    necessarily the end of the LP's full lookahead horizon; see
-    solve_dispatch_window's terminal_reserve_position docstring for why
-    that distinction matters): "if conditions as severe as the worst hour
+    `t0`, for the boundary at `target_position` hours from now -- this
+    can be the end of the CONTROL_STEP (what actually gets implemented
+    before the next re-solve) or the end of the full HORIZON (the LP's
+    complete lookahead), depending on which convention is currently
+    wanted; see solve_dispatch_window's terminal_reserve_position
+    docstring and this module's HORIZON/CONTROL_STEP comments for the
+    trade-off between the two: "if conditions as severe as the worst hour
     I've just actually observed continued for `belief_extra_hours` past
     that boundary, how much would I need left in storage by the time it's
     reached?"
 
-    Uses only the N_KNOWN real hours just observed (never the real future
-    demand), so this stays causal. IMPORTANTLY, this deliberately does NOT
-    reuse make_persistence_forecast's repeating-profile pattern: a
-    precautionary reserve target should stay conservative, and tiling the
-    full observed day (including its LOW hours) into the belief window
-    lets the backward calculation assume recharging opportunities during
-    those lows, which relaxes the target -- measured here to perform
-    worse (176.9 MWh unserved) than holding the day's PEAK flat for the
-    whole belief extension (129.2 MWh unserved), which has no such
-    recovery periods to lean on. The actual dispatch forecast (used for
-    real-time economic decisions, not this safety margin) is correctly
-    the more realistic repeating profile; this target calculation is
-    intentionally more pessimistic.
+    `n_known` is a SEPARATE parameter from `target_position` and must
+    always be the genuinely-known block (N_KNOWN, i.e. CONTROL_STEP) --
+    never `target_position` itself. Conflating the two would silently
+    treat not-yet-real future hours (e.g. hours 25-48, if the target sits
+    at the full 48h horizon while only 24h are actually known) as
+    genuinely observed data, which leaks the future into a calculation
+    that must stay causal.
+
+    Uses only real, already-observed hours (never the real future demand),
+    so this stays causal. The "worst hour observed" reference level looks
+    back FORECAST_PATTERN_HOURS (not just n_known) for the same reason
+    make_persistence_forecast decouples its tile length from
+    CONTROL_STEP: with a short CONTROL_STEP (e.g. an hourly re-solve),
+    only looking back n_known hours could miss a peak from earlier in the
+    same day. IMPORTANTLY, this deliberately does NOT reuse
+    make_persistence_forecast's repeating-profile pattern: a precautionary
+    reserve target should stay conservative, and tiling the full observed
+    day (including its LOW hours) into the belief window lets the
+    backward calculation assume recharging opportunities during those
+    lows, which relaxes the target -- measured here to perform worse
+    (176.9 MWh unserved) than holding the day's PEAK flat for the whole
+    belief extension (129.2 MWh unserved), which has no such recovery
+    periods to lean on. The actual dispatch forecast (used for real-time
+    economic decisions, not this safety margin) is correctly the more
+    realistic repeating profile; this target calculation is intentionally
+    more pessimistic.
     """
-    known = data["heat demand"].iloc[t0 : t0 + N_KNOWN]
-    reference_level = known.max()
+    known = data["heat demand"].iloc[t0 : t0 + n_known]
+    reference_lookback_start = max(0, t0 + n_known - FORECAST_PATTERN_HOURS)
+    reference_level = data["heat demand"].iloc[
+        reference_lookback_start : t0 + n_known
+    ].max()
 
     # Near the very end of the year there may not be enough real timestamps
     # left to build the full belief window; shrink it rather than error.
-    max_extra = max(0, len(data) - 1 - (t0 + control_step))
+    max_extra = max(0, len(data) - 1 - (t0 + target_position))
     belief_extra_hours = min(belief_extra_hours, max_extra)
 
-    n_future = control_step + belief_extra_hours - len(known)
+    n_future = target_position + belief_extra_hours - len(known)
     if n_future <= 0:
-        demand = known.iloc[: control_step + 1]
+        demand = known.iloc[: target_position + 1]
     else:
         demand = pd.concat(
             [known, pd.Series([reference_level] * n_future)]
         )
-    if len(demand) <= control_step:
+    if len(demand) <= target_position:
         # No room left for a belief extension (right at year-end) -- no
         # further information to base a terminal target on.
         return 0.0
     min_required = minimum_required_storage(
         demand, cap_gas_boiler, cap_heat_pump, cap_storage
     )
-    # Position `control_step` in this extended series is exactly the
+    # Position `target_position` in this extended series is exactly the
     # boundary we want a target for.
-    return float(min_required.iloc[control_step])
+    return float(min_required.iloc[target_position])
 
 
 def report_unserved_heat(dispatch, label=""):
@@ -847,6 +907,7 @@ def run_causal_dispatch(
         terminal_target_mwh = terminal_reserve_target_mwh(
             data,
             t0,
+            N_KNOWN,
             this_control_step,
             BELIEF_HORIZON_EXTRA_HOURS,
             CAP_GAS_BOILER_MW,

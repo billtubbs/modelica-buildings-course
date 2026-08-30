@@ -35,9 +35,9 @@ first shortfall hour.
 """
 
 import numpy as np
-import opt_dispatch as od
 import pandas as pd
 
+import opt_dispatch as od
 
 MARGIN_HOURS = 48  # hours of context kept on each side of the first shortfall
 
@@ -99,9 +99,7 @@ def test_first_unserved_window_isolated():
 
     lo = max(0, first_pos - MARGIN_HOURS)
     hi = min(len(data) - 1, first_pos + MARGIN_HOURS)
-    window = data.iloc[
-        lo : hi + 1
-    ]  # +1 boundary row for N intervals in [lo, hi]
+    window = data.iloc[lo : hi + 1]  # +1 boundary row for N intervals in [lo, hi]
     print(
         f"\nIsolated window: hours {lo}..{hi} "
         f"({window.index[0]} to {window.index[-1]})"
