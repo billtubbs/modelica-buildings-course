@@ -943,8 +943,16 @@ def run_causal_dispatch(
 
         # State AFTER `this_control_step` intervals have been implemented --
         # this is the correct hand-off point (not this_control_step - 1).
-        storage_level = float(
-            storage_content.iloc[this_control_step] / CAP_STORAGE_MWH
+        # Clamped to [0, 1] as a numerical-noise guard: solver-precision
+        # noise (e.g. -1e-12) could otherwise push this fractionally
+        # outside the valid range and trip oemof's strict bounds check on
+        # the next window's initial_storage_level.
+        storage_level = min(
+            1.0,
+            max(
+                0.0,
+                float(storage_content.iloc[this_control_step] / CAP_STORAGE_MWH),
+            ),
         )
 
         t0 += this_control_step
