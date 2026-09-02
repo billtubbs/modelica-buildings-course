@@ -1,3 +1,9 @@
-*.egg-info
-
+data/
+plots/
+results/
 tutorials/district_heating_supply/plots
+
+*.egg-info
+*.pyc
+
+.vscode
