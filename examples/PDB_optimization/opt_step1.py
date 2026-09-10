@@ -48,9 +48,6 @@ created automatically if they do not exist):
     A summary table of all solved cases is also printed to the console.
 """
 
-# TODO:
-# 1. Organize default parameter values in solve_case as literals
-
 from pathlib import Path
 
 import pandas as pd
@@ -134,6 +131,18 @@ def solve_case(
     use_storage=True,
     cap_heat_pump_fixed=None,
     cap_storage_fixed=None,
+    res_time_in=24,
+    res_time_out=24,
+    cop=3.5,
+    spec_inv_heat_pump=500000,
+    var_cost_heat_pump=1.2,
+    spec_inv_gas_boiler=60000,
+    var_cost_gas_boiler=1.10,
+    gas_boiler_efficiency=0.95,
+    spec_inv_storage=1060,
+    var_cost_storage=0.1,
+    co2_gas=0.2,
+    co2_el=0.15,
     case_label=None,
 ):
     """Solve one design case.
@@ -141,21 +150,19 @@ def solve_case(
     Capacities are investment variables by default. Passing
     ``cap_heat_pump_fixed`` / ``cap_storage_fixed`` pins that capacity instead,
     which turns the run into a pure dispatch problem for a prescribed design.
+
+    ``res_time_in`` / ``res_time_out`` are the storage residence times [h] --
+    the ratio of energy capacity to charge / discharge power. They set the
+    storage C-rate: the charge/discharge flow limit is energy capacity divided
+    by the corresponding residence time (equivalently ``invest_relation_*`` is
+    ``1 / res_time_*`` in investment mode).
+
+    The remaining keyword arguments are the techno-economic constants:
+    ``cop`` (heat pump coefficient of performance), the specific investment
+    costs ``spec_inv_*`` [EUR/MW or EUR/MWh], the variable O&M costs
+    ``var_cost_*`` [EUR/MWh], ``gas_boiler_efficiency``, and the emission
+    factors ``co2_gas`` / ``co2_el`` [tCO2/MWh].
     """
-    cop = 3.5
-    spec_inv_heat_pump = 500000
-    var_cost_heat_pump = 1.2
-
-    spec_inv_gas_boiler = 60000
-    var_cost_gas_boiler = 1.10
-    gas_boiler_efficiency = 0.95
-
-    spec_inv_storage = 1060
-    var_cost_storage = 0.1
-
-    co2_gas = 0.2
-    co2_el = 0.15
-
     gas_source_cost = data["gas price"] + co2_price * co2_gas
     electricity_source_cost = data["el_spot_price"] + co2_price * co2_el
     hp_var_cost = var_cost_heat_pump
@@ -257,18 +264,21 @@ def solve_case(
 
     if use_storage:
         # invest_relation_* is only meaningful in investment mode; with a pinned
-        # energy capacity the same 1/24 C-rate is applied directly to the flows.
+        # energy capacity the same C-rate (1 / residence time) is applied
+        # directly to the flows.
         if cap_storage_fixed is not None:
             storage_extra = {}
             storage_nominal = cap_storage_fixed
-            storage_flow_capacity = cap_storage_fixed / 24
+            storage_in_capacity = cap_storage_fixed / res_time_in
+            storage_out_capacity = cap_storage_fixed / res_time_out
         else:
             storage_extra = {
-                "invest_relation_input_capacity": 1 / 24,
-                "invest_relation_output_capacity": 1 / 24,
+                "invest_relation_input_capacity": 1 / res_time_in,
+                "invest_relation_output_capacity": 1 / res_time_out,
             }
             storage_nominal = solph.Investment(ep_costs=epc(spec_inv_storage))
-            storage_flow_capacity = solph.Investment()
+            storage_in_capacity = solph.Investment()
+            storage_out_capacity = solph.Investment()
 
         heat_storage = solph.components.GenericStorage(
             label="heat storage",
@@ -276,13 +286,13 @@ def solve_case(
             inputs={
                 heat_bus: solph.flows.Flow(
                     variable_costs=storage_var_cost,
-                    nominal_capacity=storage_flow_capacity,
+                    nominal_capacity=storage_in_capacity,
                 )
             },
             outputs={
                 heat_bus: solph.flows.Flow(
                     variable_costs=storage_var_cost,
-                    nominal_capacity=storage_flow_capacity,
+                    nominal_capacity=storage_out_capacity,
                 )
             },
             balanced=True,
@@ -342,7 +352,7 @@ def solve_case(
         cap_storage_out = 0.0
     elif cap_storage_fixed is not None:
         cap_storage = cap_storage_fixed
-        cap_storage_out = cap_storage_fixed / 24
+        cap_storage_out = cap_storage_fixed / res_time_out
     else:
         cap_storage = solph.views.node(results, "heat storage")["scalars"][
             (("heat storage", "None"), "invest")
